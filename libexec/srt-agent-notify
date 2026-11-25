@@ -1,0 +1,264 @@
+#!/usr/bin/python3 -I
+"""Focus-aware notifier for srt-agent's notification relay (notify.command).
+
+Reads the relay's JSON from stdin and then does one of three things: nothing
+(you are looking at the agent), a tmux border banner (its tmux pane is visible
+but not focused) or a macOS notification through alerter (anything else).
+Nothing ever flows back to the agent.
+
+In tmux, you are looking at the pane when its window and pane are active and
+a tmux client of its session has terminal focus. That is the "focused" client
+flag, which needs focus-events on. The terminal reports focus for both app
+switches and tab switches, so tmux inside WezTerm needs no WezTerm check.
+Known limitation: tmux tracks the active window and pane per session, not per
+client.
+
+Outside tmux, only WezTerm is handled: WezTerm must be frontmost and its
+focused pane must be $WEZTERM_PANE. Every other case notifies.
+
+Clicking the notification shows the agent: a detached helper waits for
+alerter, then selects the tmux pane in its most recently used client, the
+WezTerm tab and pane running that client (matched by tty), or outside tmux
+the WezTerm pane, and brings the terminal app ($__CFBundleIdentifier) to the
+front.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+ICON = "/Applications/Claude.app/Contents/Resources/electron.icns"
+TIMEOUT = 30  # seconds; only used when focusing a tmux pane can't clear the notification
+# Absolute path for each program, or None to look it up on PATH.
+PROGRAMS = {"tmux": None, "lsappinfo": None, "alerter": None, "open": None,
+            "wezterm": "/Applications/WezTerm.app/Contents/MacOS/wezterm"}
+WEZTERM_ID = "com.github.wez.wezterm"
+EVENTS = {"stop": "Stop", "notification": "Notification", "permission": "Notification",
+          "idle": "Notification", "failure": "StopFailure"}
+BANNERS = {"stop": "Finished", "notification": "Needs input", "permission": "Needs permission",
+           "idle": "Waiting for input", "failure": "Failed"}
+BUNDLE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,127}")
+PANE_RE = re.compile(r"%[0-9]+")
+AGENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+SESSION_RE = re.compile(r"[0-9a-f]{1,64}")
+NUMBER_RE = re.compile(r"[0-9]+")
+
+
+def program(name):
+    path = PROGRAMS[name] or shutil.which(name)
+    return path if path and os.path.isabs(path) else None
+
+
+def run(name, *args):
+    """Run a fixed program with an argument list. Return its stdout, or None."""
+    path = program(name)
+    if not path:
+        return None
+    try:
+        p = subprocess.run([path, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def parse(raw):
+    """Return (event, agent, message, pane, session), or None if anything is off."""
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return None
+    s = d.get("srt_agent") if isinstance(d, dict) else None
+    if not isinstance(s, dict):
+        return None
+    event, agent, msg = s.get("event"), s.get("agent"), d.get("message")
+    pane, session = s.get("tmux_pane") or "", d.get("session_id")
+    ok = (event in EVENTS and d.get("hook_event_name") == EVENTS[event]
+          and isinstance(agent, str) and AGENT_RE.fullmatch(agent)
+          and isinstance(msg, str) and 0 < len(msg) <= 500 and msg.isprintable()
+          and not msg.startswith("-")
+          and isinstance(pane, str) and (pane == "" or PANE_RE.fullmatch(pane))
+          and isinstance(session, str) and SESSION_RE.fullmatch(session)
+          and isinstance(d.get("cwd"), str) and isinstance(s.get("project"), str))
+    return (event, agent, msg, pane, session) if ok else None
+
+
+def tmux(*args):
+    """Run tmux on the socket named in $TMUX, and on no other."""
+    sock = os.environ.get("TMUX", "").split(",")[0]
+    return run("tmux", "-S", sock, *args) if os.path.isabs(sock) else None
+
+
+def tmux_state(pane):
+    """Return (pane_active, on_screen), or None if tmux or the pane can't be reached.
+
+    on_screen: the pane's window is active and a client of its session has focus.
+    """
+    out = tmux("display-message", "-p", "-t", pane,
+               "#{pane_id} #{pane_active} #{window_active} #{session_id}")
+    m = re.fullmatch(r"(%[0-9]+) ([01]) ([01]) (\$[0-9]+)\n?", out or "")
+    if not m or m.group(1) != pane:
+        return None
+    flags = tmux("list-clients", "-t", m.group(4), "-F", "#{client_flags}") or ""
+    focused = any("focused" in line.split(",") for line in flags.splitlines())
+    return m.group(2) == "1", m.group(3) == "1" and focused
+
+
+def frontmost(bundle_id):
+    asn = (run("lsappinfo", "front") or "").strip()
+    if not re.fullmatch(r"ASN:0x[0-9a-fA-F]+-0x[0-9a-fA-F]+:", asn):
+        return False
+    m = re.search(r'"CFBundleIdentifier"="([^"]*)"',
+                  run("lsappinfo", "info", "-only", "bundleID", asn) or "")
+    return bool(m) and m.group(1) == bundle_id
+
+
+def wezterm_focused(pane_id):
+    """True if WezTerm is frontmost and a WezTerm client's focused pane is pane_id."""
+    if not frontmost(WEZTERM_ID):
+        return False
+    try:
+        clients = json.loads(run("wezterm", "cli", "--no-auto-start", "list-clients",
+                                 "--format", "json") or "")
+    except ValueError:
+        return False
+    return isinstance(clients, list) and any(
+        isinstance(c, dict) and type(c.get("focused_pane_id")) is int
+        and c["focused_pane_id"] == pane_id for c in clients)
+
+
+def say(text):
+    """One line for the relay's notify.log (it records our stderr)."""
+    print(text, file=sys.stderr)
+
+
+def clicked(out):
+    """True if alerter reports a click on the notification or its button.
+    We add no actions, so the only button is alerter's own "Show"."""
+    try:
+        result = json.loads(out)
+    except ValueError:
+        return out.strip() in ("@CONTENTCLICKED", "@ACTIONCLICKED")
+    return isinstance(result, dict) and result.get("activationType") in ("contentsClicked",
+                                                                         "actionClicked")
+
+
+def tmux_client_tty(pane):
+    """The tty of the most recently active tmux client of the pane's session."""
+    m = re.fullmatch(r"(\$[0-9]+)\n?", tmux("display-message", "-p", "-t", pane, "#{session_id}") or "")
+    out = (tmux("list-clients", "-t", m.group(1), "-F", "#{client_activity} #{client_tty}")
+           if m else None) or ""
+    clients = [re.fullmatch(r"([0-9]+) (/dev/tty[A-Za-z0-9]+)", line) for line in out.splitlines()]
+    clients = sorted((int(c.group(1)), c.group(2)) for c in clients if c)
+    return clients[-1][1] if clients else None
+
+
+def wezterm_show(pane_id=None, tty=None):
+    """Activate a WezTerm pane, found by ID or by its tty, and its tab."""
+    try:
+        panes = json.loads(run("wezterm", "cli", "--no-auto-start", "list", "--format", "json") or "")
+    except ValueError:
+        return
+    for p in panes if isinstance(panes, list) else []:
+        if not isinstance(p, dict) or type(p.get("pane_id")) is not int or type(p.get("tab_id")) is not int:
+            continue
+        if p["pane_id"] == pane_id or (tty and p.get("tty_name") == tty):
+            run("wezterm", "cli", "--no-auto-start", "activate-tab", "--tab-id", str(p["tab_id"]))
+            run("wezterm", "cli", "--no-auto-start", "activate-pane", "--pane-id", str(p["pane_id"]))
+            return
+
+
+def jump(pane, wezterm_pane):
+    """Show the agent: its tmux pane (and the WezTerm tab holding that tmux
+    client) or its WezTerm pane, then the terminal app."""
+    if pane:
+        tty = tmux_client_tty(pane)
+        tmux("switch-client", *(["-c", tty] if tty else []), "-t", pane)
+        tmux("select-window", "-t", pane)
+        tmux("select-pane", "-t", pane)
+        if tty:
+            wezterm_show(tty=tty)
+    elif wezterm_pane:
+        wezterm_show(pane_id=int(wezterm_pane))
+    bundle_id = os.environ.get("__CFBundleIdentifier", "")
+    if BUNDLE_RE.fullmatch(bundle_id):
+        run("open", "-b", bundle_id)
+
+
+def notify(agent, msg, group, persistent, pane, wezterm_pane):
+    """Show the notification from a detached helper, so that the relay is not
+    held up; the helper waits for alerter and jumps to the agent on a click."""
+    path = program("alerter")
+    if not path:
+        say("notify: alerter not found on PATH")
+        return
+    cmd = [path, "--title", agent, "--message", msg, "--group", group, "--json"]
+    if not persistent:
+        cmd += ["--timeout", str(TIMEOUT)]
+    if os.path.isfile(ICON):
+        cmd[1:1] = ["--app-icon", ICON]
+    try:
+        child = os.fork()
+    except OSError as e:
+        say("notify: cannot start a helper: %s" % e.strerror)
+        return
+    if child:
+        say("notify: started %s, group %s%s" % (path, group, "" if persistent else ", timeout"))
+        return
+    try:  # Helper: own session, no stdio shared with the relay.
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        out = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True).stdout
+        if clicked(out):
+            jump(pane, wezterm_pane)
+    finally:
+        os._exit(0)
+
+
+def main():
+    parsed = parse(sys.stdin.read(65536))
+    if not parsed:
+        return
+    event, agent, msg, pane, session = parsed
+    persistent, group, wezterm_pane = False, "srt-agent-" + session, ""
+    if pane or os.environ.get("TMUX"):
+        # In tmux. $WEZTERM_PANE here belongs to whatever started the tmux
+        # server, so it is never used.
+        state = tmux_state(pane) if pane else None
+        if state and state[1]:
+            if state[0]:
+                say("tmux pane %s focused: silent" % pane)
+                return
+            if tmux("set-option", "-p", "-t", pane, "@srt_notice", BANNERS[event]) is not None:
+                say("tmux pane %s visible: banner" % pane)
+                return
+        say("tmux pane %s: %s" % (pane or "-", "not on screen" if state else "not reachable"))
+        # @srt_alert tells the tmux focus hook to remove this notification, so
+        # it can stay until then. Pane IDs are unique per tmux server only, so
+        # the group includes the server PID from $TMUX ("socket,pid,session"),
+        # which the hook gets from #{pid}.
+        persistent = bool(pane) and tmux("set-option", "-p", "-t", pane,
+                                         "@srt_alert", "1") is not None
+        server = (os.environ.get("TMUX", "").split(",") + ["", ""])[1]
+        if pane and NUMBER_RE.fullmatch(server):
+            group = "srt-agent-%s-%s" % (server, pane)
+    else:
+        wezterm_pane = os.environ.get("WEZTERM_PANE", "")
+        if not NUMBER_RE.fullmatch(wezterm_pane):
+            say("no tmux, no WezTerm pane")
+            wezterm_pane = ""
+        elif wezterm_focused(int(wezterm_pane)):
+            say("WezTerm pane %s focused: silent" % wezterm_pane)
+            return
+        else:
+            say("WezTerm pane %s not focused or WezTerm not frontmost" % wezterm_pane)
+    notify(agent, msg, group, persistent, pane if persistent else "", wezterm_pane)
+
+
+if __name__ == "__main__":
+    main()
