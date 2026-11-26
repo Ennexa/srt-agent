@@ -26,6 +26,7 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "srt-agent"
 AGENT = "probe"
 NETWORK = os.environ.get("SRT_AGENT_INTEGRATION_NETWORK", "1") != "0"
+STARTED = "srt-agent-probe-started"
 
 
 class Captured(Exception):
@@ -102,7 +103,10 @@ class SeatbeltTest(unittest.TestCase):
         return self.sa.project_storage_path(self.project)
 
     def run_in_sandbox(self, command):
-        # The exact command and environment main() would exec.
+        # The exact command and environment main() would exec. The marker
+        # proves the command started inside the sandbox: a refusal only
+        # counts if srt actually ran it.
+        command = "echo " + STARTED + "; " + command
         captured = {}
 
         def execve(path, argv, env):
@@ -116,8 +120,11 @@ class SeatbeltTest(unittest.TestCase):
             except Captured:
                 pass
         self.assertTrue(captured, "the launcher did not reach exec")
-        return subprocess.run(captured["argv"], env=captured["env"], cwd=str(self.project),
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(captured["argv"], env=captured["env"], cwd=str(self.project),
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        self.assertIn(STARTED, result.stdout, "srt did not start the command\nexit: " + str(result.returncode)
+                      + "\nstdout: " + result.stdout + "\nstderr: " + result.stderr)
+        return result
 
     def allowed(self, command):
         result = self.run_in_sandbox(command)

@@ -4246,6 +4246,10 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
         activate_session_registry(project, home, scope)
     policy = copy.deepcopy(base)
     network = policy["network"]
+    # srt requires both lists (0.0.81 refuses a settings file without
+    # deniedDomains), even when nothing is allowed or denied.
+    for name in ("allowedDomains", "deniedDomains"):
+        network.setdefault(name, [])
     # Switches: off unless a layer (import, global, groups, project) turned
     # them on, all approved; --allow-local-binding turns local binding on for
     # this launch only. allowPty is always true.

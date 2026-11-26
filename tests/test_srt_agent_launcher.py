@@ -86,6 +86,12 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(json.loads(policy_path.read_text()), shown)
         self.assertEqual((Path(child_env["HOME"]) / ".config/x.txt").read_text(), "hello")
 
+    def test_policy_always_lists_both_domain_lists(self):
+        # srt 0.0.81 refuses a settings file without network.deniedDomains.
+        (self.config / "config.jsonc").write_text(json.dumps({"network": {}}))
+        network = self.show()["policy"]["network"]
+        self.assertEqual((network["allowedDomains"], network["deniedDomains"]), ([], []))
+
     def test_launch_uses_the_approved_template_snapshot(self):
         policy = self.sa.load_base_policy(self.project, self.config / "config.jsonc")
         (self.config / "home/common/.config/x.txt").write_text("changed after approval")
