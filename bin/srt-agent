@@ -3920,9 +3920,20 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     # and write-denied below with every other PATH entry.
     extra_path = []
     project_launcher = grants.get("launcher", {})
-    for entry in options.get("path", []) + profile["path"] + project_launcher.get("path", []):
+    host_entries = options.get("path", []) + profile["path"]
+    project_entries = project_launcher.get("path", [])
+    approved_targets = project_launcher.get("resolved_path", [])
+    for index, entry in enumerate(host_entries + project_entries):
         directory = resolve_project_path(project, entry, canonical=False)
-        for spelled in (directory, directory.resolve()):
+        target = directory.resolve()
+        if index >= len(host_entries):
+            # A project path entry was approved with its resolved target:
+            # grant exactly that one, never a target that moved since.
+            approved = approved_targets[index - len(host_entries)]
+            if str(target) != approved:
+                fail("Project path " + entry + " now resolves to " + str(target) + ", not the approved "
+                     + approved + "; review it again (srt-agent project approve)")
+        for spelled in (directory, target):
             if spelled.is_relative_to(project) or account_home().is_relative_to(spelled):
                 fail("path (global or project) cannot add the project, your home or an ancestor: " + str(spelled))
             read_paths.append(str(spelled))
@@ -4083,14 +4094,18 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     # agent-writable directory: srt is a node script started via env, and a
     # planted <agent home>/.local/bin/node would otherwise run unsandboxed.
     # The private HOME/PATH are applied inside the sandbox by EXEC_CODE.
-    env = dict(passed)
+    # Of your variables, srt itself gets only the terminal and locale basics.
+    # Agent passEnv (provider keys, NODE_OPTIONS, ...) travels only inside
+    # SRT_AGENT_CHILD_ENV, applied by EXEC_CODE, so host-side node and its
+    # helpers never run with it.
+    env = passthrough_env(BASE_PASS_ENV, child_env)
     env.update({
         "HOME": str(account_home()),
         "PATH": host_path(project),
         # Only srt itself needs the short path for its pre-sandbox Unix
         # sockets; it is launcher-owned, never the agent-writable tmp.
         "TMPDIR": str(host_temp_link),
-        "SRT_AGENT_CHILD_ENV": json.dumps(child_env, ensure_ascii=True),
+        "SRT_AGENT_CHILD_ENV": json.dumps({**passed, **child_env}, ensure_ascii=True),
     })
     # The in-sandbox wrapper is /usr/bin/python3, which on macOS is an
     # xcode-select stub: without DEVELOPER_DIR it reads the

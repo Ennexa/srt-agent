@@ -371,7 +371,7 @@ The file must be strict JSON (no comments) with srt's lists and switches only; a
 
 ## Environment variables
 
-The environment is deny-by-default. Only terminal and locale variables, each agent's own documented settings (Claude: `ANTHROPIC_*`, `CLAUDE_CODE_*`; Codex: `OPENAI_*`; dsh: `DEEPSEEK_API_KEY`, `DSH_*`; pi: `PI_*`) and names listed in `passEnv` reach the sandbox. Cloud, GitHub and SSH-agent credentials are not inherited unless listed.
+The environment is deny-by-default. Only terminal and locale variables, each agent's own documented settings (Claude: `ANTHROPIC_*`, `CLAUDE_CODE_*`; Codex: `OPENAI_*`; dsh: `DEEPSEEK_API_KEY`, `DSH_*`; pi: `PI_*`) and names listed in `passEnv` reach the sandbox. Cloud, GitHub and SSH-agent credentials are not inherited unless listed. `srt` itself runs outside the sandbox and gets only the terminal and locale variables. Agent settings and `passEnv` names are handed straight to the agent's process inside the sandbox, so host-side tools never run with them (a passed `NODE_OPTIONS`, for example, doesn't affect `srt`'s own Node).
 
 `setEnv` sets variables; precedence is global, then project, then the agent's. Launcher-managed names (`PATH`, `HOME`, `XDG_*`, proxies, `DYLD_*`, `LD_*`, …) cannot be set, except `TMPDIR`, which may point into `{cache}`.
 

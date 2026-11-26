@@ -97,6 +97,39 @@ class LauncherTest(unittest.TestCase):
             self.sa.load_base_policy = original
         self.assertEqual((Path(child_env["HOME"]) / ".config/x.txt").read_text(), "hello")
 
+    def test_agent_passthrough_skips_the_host_env(self):
+        (self.config / "config.jsonc").write_text(json.dumps({
+            "network": {"allowedDomains": ["example.com"]}, "passEnv": ["FAKE_PROVIDER_KEY"]}))
+        os.environ["FAKE_PROVIDER_KEY"] = "secret"
+        os.environ.setdefault("TERM", "xterm-256color")
+        self.addCleanup(os.environ.pop, "FAKE_PROVIDER_KEY", None)
+        child_env, env = self.launch()[3:5]
+        self.assertNotIn("FAKE_PROVIDER_KEY", env)
+        self.assertEqual(env["TERM"], os.environ["TERM"])
+        agent_env = json.loads(env["SRT_AGENT_CHILD_ENV"])
+        self.assertEqual(agent_env["FAKE_PROVIDER_KEY"], "secret")
+        self.assertNotIn("FAKE_PROVIDER_KEY", child_env)  # --show prints child_env
+
+    def test_project_path_must_still_resolve_to_the_approved_target(self):
+        tools = self.base / "tools"
+        (tools / "v1").mkdir(parents=True)
+        (tools / "v2").mkdir()
+        link = tools / "current"
+        link.symlink_to(tools / "v1")
+        self.write_project({"path": [str(link)]})
+        approved = self.sa.project_permissions(self.project, self.config / "config.jsonc")
+        self.assertEqual(approved[1]["launcher"]["resolved_path"], [str(tools / "v1")])
+        self.launch()  # unchanged target: fine
+        link.unlink()
+        link.symlink_to(tools / "v2")  # retargeted after approval
+        original = self.sa.project_permissions
+        self.sa.project_permissions = lambda *args, **kwargs: approved
+        try:
+            with self.assertRaisesRegex(RuntimeError, "not the approved"):
+                self.launch()
+        finally:
+            self.sa.project_permissions = original
+
     def test_oversized_file_at_a_template_path_is_backed_up_unread(self):
         child_env = self.launch()[3]
         target = Path(child_env["HOME"]) / ".config/x.txt"
