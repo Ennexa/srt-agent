@@ -112,7 +112,9 @@ class SeatbeltTest(unittest.TestCase):
         self.write_project({})
 
     def write_project(self, extra):
-        (self.project / ".srt-agent.jsonc").write_text(json.dumps({"filesystem": {}, **extra}))
+        # What srt-agent project init writes: the workspace, readable and writable.
+        (self.project / ".srt-agent.jsonc").write_text(json.dumps(
+            {"filesystem": {"allowRead": ["."], "allowWrite": ["."]}, **extra}))
 
     @property
     def storage(self):
@@ -159,6 +161,12 @@ class SeatbeltTest(unittest.TestCase):
     def test_the_workspace_is_writable(self):
         self.allowed("echo ok > '" + str(self.project / "out.txt") + "'")
         self.assertEqual((self.project / "out.txt").read_text(), "ok\n")
+
+    def test_without_a_write_grant_the_workspace_is_not_writable(self):
+        self.write_project({"filesystem": {"allowRead": ["."]}})
+        self.allowed("cat '" + str(self.project / ".srt-agent.jsonc") + "' >/dev/null")
+        self.refused("echo ok > '" + str(self.project / "denied.txt") + "'")
+        self.assertFalse((self.project / "denied.txt").exists())
 
     def test_the_agent_home_and_temp_are_writable(self):
         self.allowed('echo ok > "$HOME/note" && echo ok > "$TMPDIR/note"')
