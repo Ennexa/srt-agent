@@ -61,8 +61,10 @@ Install from the host, never from inside a sandbox:
 
 ```sh
 make diff      # review what would change
-make install   # runs the tests, then copies the programs root-owned into /usr/local
+make install   # runs the tests and the sandbox probes, then copies the programs root-owned into /usr/local
 ```
+
+Before copying anything, `make install` runs the unit tests and the offline integration probes. The probes launch this checkout's `bin/srt-agent` through your installed `srt` against a scratch home and project, and check that Seatbelt actually enforces the policy. Workspace, agent home and temp must be writable. Your home, the approval store, policy files, `srt`'s temp folder, other agents' homes and host-run project files (`.git/config` and hooks, `.envrc`, `.vscode`, `.srt-agent.jsonc`) must be out of reach. An extended group must grant exactly its paths. `make integration` also runs the network probes (direct connections refused, only allowed domains through the proxy), which need internet access. `SRT_AGENT_SRT_VERSION=x.y.z` fails the probes on any other `srt` version. If `srt` itself is broken and you need to install anyway, `make install SKIP_INTEGRATION=1` skips them.
 
 The installed programs are root-owned copies, not links, so no agent can change them, however it was started. Changes in this checkout take effect only when you run `make install` again, which makes that your review step. Check that `/usr/local` and `/usr/local/bin` are owned by root (`stat -f '%Su %Sp' /usr/local/bin`); an old Intel Homebrew install may have made them yours.
 
