@@ -56,7 +56,23 @@ class SeatbeltTest(unittest.TestCase):
         if not Path(developer).is_dir():
             raise RuntimeError("Set DEVELOPER_DIR: the in-sandbox wrapper is the /usr/bin/python3 xcrun stub")
         cls.settings.write_text(json.dumps({
-            "network": {"allowedDomains": ["example.com"]},
+            # The README's recommended global config (system reads, DNS), so
+            # the probes exercise the setup people actually run.
+            "network": {
+                "allowedDomains": ["example.com"],
+                "allowUnixSockets": ["/private/var/run/mDNSResponder"],
+                "allowMachLookup": ["com.apple.trustd.agent", "com.apple.dnssd.service",
+                                    "com.apple.SystemConfiguration.DNSConfiguration",
+                                    "com.apple.SystemConfiguration.configd"],
+            },
+            "filesystem": {
+                "allowRead": ["/bin", "/sbin", "/usr", "/etc", "/private/etc",
+                              "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/fd",
+                              "/System/Library", "/System/Cryptexes/OS",
+                              "/Library/Developer", "/Library/Frameworks",
+                              "/opt/homebrew/bin", "/opt/homebrew/sbin",
+                              "/opt/homebrew/opt", "/opt/homebrew/Frameworks"],
+            },
             # As the README recommends: the xcrun stubs then need no /var/select.
             "setEnv": {"DEVELOPER_DIR": developer},
             "agents": {AGENT: {"binary": "sh"}},
@@ -179,6 +195,7 @@ class SeatbeltTest(unittest.TestCase):
     def test_host_run_files_in_the_project_are_write_protected(self):
         for target in (".srt-agent.jsonc", ".git/config", ".git/hooks/pre-commit", ".envrc", ".vscode/tasks.json"):
             with self.subTest(target=target):
+                self.write_project({})  # a failed protection must not break the next launch
                 self.refused("mkdir -p \"$(dirname '" + target + "')\" 2>/dev/null; echo x >> '" + target + "'")
         self.assertFalse((self.project / ".git/hooks/pre-commit").exists())
         self.assertEqual((self.project / ".git/config").read_text(), "[core]\n")
