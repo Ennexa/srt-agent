@@ -353,15 +353,16 @@ A launch with new or changed global or project settings stops for approval at th
 srt-agent: approval needed for "~/Projects/taskle" (settings changed)
   Groups: + "docker", + "lang/node"
 
-  HIGH    ~ allowAllUnixSockets: off → on   (via group docker)
-            EVERY Unix socket, including Docker's (root) and agents holding your keys
-  MEDIUM  + allowedDomains "registry.npmjs.org"   (via group lang/node)
-  MEDIUM  + "setEnv.FOO": "1"
   low     - allowRead "~/old-tools"
             tightens
+  MEDIUM  + setEnv "FOO": "1"
+  MEDIUM  + allowedDomains "registry.npmjs.org"   (via group lang/node)
+  HIGH    ~ allowAllUnixSockets: off → on   (via group docker)
+            EVERY Unix socket, including Docker's (root) and agents holding your keys
 ```
 
-- The lines come from the effective policy, before and after, so a change can't hide in formatting or inside an extended group. Each one says where it came from: a group, the global config, or (no note) the project file. An added group shows up once, on the `Groups` line; what it grants is listed with `via group`.
+- The highest risk comes last, right above the questions, so it's still on screen when you answer.
+- The lines come from the effective policy and launcher settings (`path` in order, `setEnv`, `agentHome`), compared before and after with groups merged in. So a change can't hide in formatting or inside an extended group. Each line says where it came from: a group, the global config, `project remove` (an inherited entry the project drops), or (no note) the project file. An added group shows up once, on the `Groups` line; what it grants is listed with `via group`. A first approval compares against the global settings *before* the project's `remove`, so dropping an inherited block shows as the block it drops, at its own risk level.
 - **HIGH:** switches that let code act outside the sandbox (`allowAllUnixSockets`, `allowAppleEvents`, the weaker-isolation switches), Unix sockets and Mach services, write access outside the project, and removed write blocks outside it. **MEDIUM:** domains, read access outside the project, removed read or domain blocks, `allowLocalBinding`, and changes to settings such as `setEnv`, `path`, `passEnv`, `agents` or `notify`. **low:** tightenings, access inside the project, and everything else.
 - Then come the questions, set apart from the summary. Each HIGH change gets its own step, and you must type `yes` in full. Everything else is approved together with one `y`, a step that's skipped when only HIGH changes remain. `d` at any question prints the full diff and resolved permissions, then asks again. Any other answer launches nothing and records nothing.
 
@@ -381,7 +382,7 @@ The file must be strict JSON (no comments) with srt's lists and switches only; a
 
 ## Environment variables
 
-The environment is deny-by-default. Only terminal and locale variables, each agent's own documented settings (Claude: `ANTHROPIC_*`, `CLAUDE_CODE_*`; Codex: `OPENAI_*`; dsh: `DEEPSEEK_API_KEY`, `DSH_*`; pi: `PI_*`) and names listed in `passEnv` reach the sandbox. Cloud, GitHub and SSH-agent credentials are not inherited unless listed. `srt` itself runs outside the sandbox and gets only the terminal and locale variables. Agent settings and `passEnv` names are handed straight to the agent's process inside the sandbox, so host-side tools never run with them (a passed `NODE_OPTIONS`, for example, doesn't affect `srt`'s own Node).
+The environment is deny-by-default. Only terminal and locale variables, each agent's own documented settings (Claude: `ANTHROPIC_*`, `CLAUDE_CODE_*`; Codex: `OPENAI_*`; dsh: `DEEPSEEK_API_KEY`, `DSH_*`; pi: `PI_*`) and names listed in `passEnv` reach the sandbox. Cloud, GitHub and SSH-agent credentials are not inherited unless listed. `srt` runs outside the sandbox, and of your variables it gets only the terminal and locale ones as real environment variables. Agent settings and `passEnv` values travel inside a single variable, `SRT_AGENT_CHILD_ENV`, and only the launcher's wrapper inside the sandbox turns them back into variables. So host-side tools never run with them (a passed `NODE_OPTIONS`, for example, doesn't affect `srt`'s own Node). They do still pass through `srt` and its host-side children as that one variable, so you're trusting the installed `srt` with your provider keys, as you would with any launcher.
 
 `setEnv` sets variables; precedence is global, then project, then the agent's. Launcher-managed names (`PATH`, `HOME`, `XDG_*`, proxies, `DYLD_*`, `LD_*`, …) cannot be set, except `TMPDIR`, which may point into `{cache}`.
 
@@ -471,7 +472,7 @@ With tmux, `set -g monitor-bell on` and `set -g bell-action other` turn the bell
 "notify": {"command": ["/usr/local/libexec/srt-agent-notify"]},
 ```
 
-The agent gets `SRT_AGENT_NOTIFY`, a named pipe in its temp folder, and may write only the words `stop`, `notification`, `permission`, `idle` or `failure`, one per line; anything else is ignored, and each word is limited to one per 3 seconds. At most 4 programs run at once; events arriving meanwhile are dropped. Dropped lines are counted and logged as one summary a minute, so a flood can't crowd real events out of the log. A relay outside the sandbox then runs your program with JSON on stdin, shaped like a Claude Code hook input so hook-based tools can read it:
+The agent gets `SRT_AGENT_NOTIFY`, a named pipe in its temp folder, and may write only the words `stop`, `notification`, `permission`, `idle` or `failure`, one per line; anything else is ignored, and each word is limited to one per 3 seconds. At most 4 notifications are live at once, each counted with whatever it leaves running in its process group (such as the bundled notifier's click helper). A new event stops the oldest to make room, so the newest notification always gets through. Dropped lines are counted and logged as one summary a minute, so a flood can't crowd real events out of the log. A relay outside the sandbox then runs your program with JSON on stdin, shaped like a Claude Code hook input so hook-based tools can read it:
 
 ```json
 {"hook_event_name": "Stop", "session_id": "…", "cwd": "/Users/you/Projects/taskle",
@@ -479,7 +480,7 @@ The agent gets `SRT_AGENT_NOTIFY`, a named pipe in its temp folder, and may writ
  "srt_agent": {"event": "stop", "agent": "claude", "project": "/Users/you/Projects/taskle", "tmux_pane": "%7"}}
 ```
 
-Every value comes from the launcher, recorded before the sandbox started; no agent text is passed on, and nothing flows back — no replies and no permission decisions, so approvals always happen in the session itself. The program's environment holds only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TMUX`, `TMUX_PANE`, `WEZTERM_PANE`, `TMPDIR`, `__CFBundleIdentifier` and `TERM_PROGRAM` from your launch. Its `PATH` leaves out any folder inside the project, and it starts in `/`, so neither it nor the helpers it looks up are taken from the workspace. A program still running after 10 minutes gets `SIGTERM` for its process group, then `SIGKILL` 5 seconds later. The program is write-denied in every session, both as named and with symlinks resolved; files it imports or runs are not. The relay ends with the session. Claude hooks for it:
+Every value comes from the launcher, recorded before the sandbox started; no agent text is passed on, and nothing flows back — no replies and no permission decisions, so approvals always happen in the session itself. The program's environment holds only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TMUX`, `TMUX_PANE`, `WEZTERM_PANE`, `TMPDIR`, `__CFBundleIdentifier` and `TERM_PROGRAM` from your launch. Its `PATH` leaves out any folder inside the project, and it starts in `/`, so neither it nor the helpers it looks up are taken from the workspace. A process group still running after an hour gets `SIGTERM`, then `SIGKILL` 5 seconds later. Only the last 2,000 bytes of the program's stderr are read for the log. The program is write-denied in every session, both as named and with symlinks resolved; files it imports or runs are not. The relay ends with the session. Claude hooks for it:
 
 ```jsonc
 "Stop": [{"hooks": [{"type": "command", "command": "[ -n \"$SRT_AGENT_NOTIFY\" ] && printf 'stop\\n' > \"$SRT_AGENT_NOTIFY\" || true"}]}],
@@ -512,7 +513,7 @@ Outside tmux, the WezTerm check uses `lsappinfo` for the frontmost app and `wezt
 - **In tmux:** it selects the agent's pane in the session's most recently used client (`switch-client -c <tty>`, `select-window`, `select-pane`). In WezTerm it also switches to the tab and pane running that tmux client, found by matching the client's tty in `wezterm cli list` (`activate-tab`, `activate-pane`). Ghostty has no such command, so there you only get the app brought forward.
 - **Outside tmux in WezTerm:** it activates the agent's tab and pane. A timeout, dismissal or focus-removal does nothing. Under tmux, `__CFBundleIdentifier` is the terminal that started the tmux server.
 
-The notifier runs only `tmux` (on the `$TMUX` socket), `lsappinfo`, `wezterm` (`list-clients`, `list`, `activate-tab`, `activate-pane`), `alerter` and `open`, always with argument lists. It ignores any input it doesn't expect, and nothing goes back to the agent. Each decision is written as one line to stderr, which the relay records in `~/.local/state/srt-agent/notify.log` (for example `stderr: WezTerm pane 3 focused: silent`). The click helper runs in its own session, outside the relay's supervision, so it stops waiting for `alerter` after an hour (`HELPER_DEADLINE`), even for a persistent notification. You can change the icon, the timeouts and the program paths with the constants at the top of the script.
+The notifier runs only `tmux` (on the `$TMUX` socket), `lsappinfo`, `wezterm` (`list-clients`, `list`, `activate-tab`, `activate-pane`), `alerter` and `open`, always with argument lists. It ignores any input it doesn't expect, and nothing goes back to the agent. Each decision is written as one line to stderr, which the relay records in `~/.local/state/srt-agent/notify.log` (for example `stderr: WezTerm pane 3 focused: silent`). The click helper stays in the notifier's process group, so the relay counts it and stops it at its time limit. It also stops waiting for `alerter` on its own after an hour (`HELPER_DEADLINE`), even for a persistent notification. You can change the icon, the timeouts and the program paths with the constants at the top of the script.
 
 **Known limitation:** tmux tracks the active window and pane per session, not per client. If two clients show the same session, "focused" and "visible" can be wrong.
 

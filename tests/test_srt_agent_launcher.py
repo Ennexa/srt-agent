@@ -119,7 +119,9 @@ class LauncherTest(unittest.TestCase):
         self.write_project({"path": [str(link)]})
         approved = self.sa.project_permissions(self.project, self.config / "config.jsonc")
         self.assertEqual(approved[1]["launcher"]["resolved_path"], [str(tools / "v1")])
-        self.launch()  # unchanged target: fine
+        child_env = self.launch()[3]  # unchanged target: fine, and only the target is used
+        self.assertIn(str(tools / "v1"), child_env["PATH"].split(":"))
+        self.assertNotIn(str(link), child_env["PATH"].split(":"))
         link.unlink()
         link.symlink_to(tools / "v2")  # retargeted after approval
         original = self.sa.project_permissions
@@ -230,10 +232,12 @@ class ApprovalPromptTest(unittest.TestCase):
         domain = self.find(changes, "registry.npmjs.org")
         self.assertEqual((domain["level"], domain["source"]), ("medium", "via group lang/node"))
         self.assertEqual(self.find(changes, '"~/notes"')["level"], "medium")
-        self.assertEqual(self.find(changes, "setEnv.FOO")["level"], "medium")
+        self.assertEqual(self.find(changes, 'setEnv "FOO"')["level"], "medium")
         self.assertEqual(self.find(changes, '"./out"')["level"], "low")  # removed: tightens
-        self.assertEqual([c["level"] for c in changes], sorted((c["level"] for c in changes),
-                                                               key=self.sa.RISK_LEVELS.index))
+        # Highest risk last, right above the questions.
+        levels = [c["level"] for c in changes]
+        self.assertEqual(levels, sorted(levels, key=self.sa.RISK_LEVELS.index, reverse=True))
+        self.assertEqual(levels[-1], "high")
         text = self.sa.render_approval(self.project, "settings changed", changes, False)
         self.assertIn('Groups: + "docker", + "lang/node"', text)
 
@@ -276,6 +280,42 @@ class ApprovalPromptTest(unittest.TestCase):
         text = self.sa.render_approval(self.project, "settings changed", changes, False)
         self.assertNotIn("\x1b", text)
         self.assertIn("\\u001b", text)
+
+    def test_first_approval_shows_removed_inherited_blocks_by_their_effect(self):
+        (self.home / "secrets").mkdir()
+        (self.config / "config.jsonc").write_text(json.dumps({
+            "network": {"allowedDomains": ["example.com"], "deniedDomains": ["evil.example"]},
+            "filesystem": {"denyWrite": ["~/secrets"]}}))
+        self.write_project({"remove": {"filesystem": {"denyWrite": ["~/secrets"]},
+                                       "network": {"deniedDomains": ["evil.example"]}}})
+        settings = self.config / "config.jsonc"
+        _, grants, data, _ = self.sa.project_permissions(self.project, settings)
+        policy = self.sa.load_base_policy(self.project, settings, removals=grants["remove"])
+        baseline = self.sa.load_base_policy(self.project, settings)
+        changes = self.sa.approval_changes(self.project, {}, data, grants, policy, baseline=baseline)
+        block = self.find(changes, "denyWrite")
+        self.assertEqual((block["level"], block["sign"], block["source"]), ("high", "-", "project remove"))
+        self.assertEqual(self.find(changes, "evil.example")["level"], "medium")
+        self.assertFalse([c for c in changes if "remove" in c["text"]])  # shown by effect, not as remove.*
+
+    def test_group_launcher_settings_are_shown_in_order(self):
+        (self.home / "tools/a").mkdir(parents=True)
+        (self.home / "tools/b").mkdir(parents=True)
+        config = json.loads((self.config / "config.jsonc").read_text())
+        config["groups"]["tools"] = {"path": ["~/tools/a"], "setEnv": {"TOOL_MODE": "fast"}}
+        (self.config / "config.jsonc").write_text(json.dumps(config))
+        changes = self.changes({}, {"extends": ["tools"]})
+        path = self.find(changes, 'path "~/tools/a"')
+        self.assertEqual((path["level"], path["source"]), ("medium", "via group tools"))
+        self.assertEqual(self.find(changes, 'setEnv "TOOL_MODE"')["source"], "via group tools")
+        reordered = self.changes({"path": ["~/tools/a", "~/tools/b"]}, {"path": ["~/tools/b", "~/tools/a"]})
+        self.assertEqual(self.find(reordered, "path order")["level"], "medium")
+
+    def test_ordered_settings_keep_their_order(self):
+        flat = self.sa.flat_settings
+        self.assertNotEqual(flat({"notify": {"command": ["/a", "x", "y"]}}),
+                            flat({"notify": {"command": ["/a", "y", "x"]}}))
+        self.assertEqual(flat({"passEnv": ["A", "B"]}), flat({"passEnv": ["B", "A"]}))
 
     def test_unchanged_effect_still_shows_something(self):
         grants, data, policy = self.state({})
@@ -327,11 +367,22 @@ class NotifyRelayTest(unittest.TestCase):
         self.wait_for("lines that are not event words")
         self.assertLess(log.count("\n"), 50)
 
-    def test_events_beyond_the_running_cap_are_dropped(self):
+    def test_a_new_event_beyond_the_cap_replaces_the_oldest(self):
+        self.sa.NOTIFY_KILL_GRACE = 1
         writer = self.start("sleep 30\n")
-        os.write(writer, b"".join(w.encode() + b"\n" for w in list(self.sa.NOTIFY_EVENTS)[:5]))
-        self.wait_for(": started", count=self.sa.NOTIFY_MAX_RUNNING)
-        self.wait_for("still running")
+        words = list(self.sa.NOTIFY_EVENTS)[:5]
+        os.write(writer, b"".join(w.encode() + b"\n" for w in words))
+        log = self.wait_for(": started", count=5)
+        self.wait_for("older notifications replaced by newer ones")
+        self.assertIn("event " + words[0] + ": exit", log + self.log.read_text())
+
+    def test_helpers_left_behind_count_until_they_end(self):
+        self.sa.NOTIFY_MAX_SECONDS = 1
+        self.sa.NOTIFY_KILL_GRACE = 1
+        writer = self.start("sleep 30 &\nexit 0\n")  # like the click helper: same group, outlives the program
+        os.write(writer, b"stop\n")
+        self.wait_for("event stop: exit 0")
+        self.wait_for("event stop: stopped after time limit")
 
     def test_a_program_ignoring_sigterm_is_killed(self):
         self.sa.NOTIFY_MAX_SECONDS = 0.5

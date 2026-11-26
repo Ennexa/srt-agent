@@ -179,7 +179,8 @@ deniedDomains.
 Approval prompt: one line per changed value since the last approval,
 ranked HIGH (host-level switches, sockets, Mach services, writes outside
 the project), MEDIUM (domains, reads outside the project, setEnv/path/...)
-or low, each marked with the group it came from. Each HIGH change is its
+or low (listed low first, HIGH last, just above the questions), each
+marked with the group it came from. Each HIGH change is its
 own step and needs "yes" typed in full; the rest take one "y". "d" shows
 the full diff. Any other answer launches nothing.
 Approval: an inline group is part of config.jsonc, so changing it asks
@@ -1327,6 +1328,11 @@ def approval_summary(base_policy, grants):
         summary[key] = sorted({text(e) for e in base_policy["filesystem"].get(key, [])}
                               | {text(e) for e in grants.get(key, [])})
     summary["switches"] = sorted(k for k, v in effective_switches(base_policy, grants).items() if v)
+    # The project's launcher settings after merging its groups, in order:
+    # PATH order decides which command runs.
+    launcher = grants.get("launcher", {})
+    summary["launcher"] = {"path": list(launcher.get("path", [])), "setEnv": dict(launcher.get("setEnv", {})),
+                           "agentHome": grants.get("agentHome")}
     return summary
 
 
@@ -1388,9 +1394,11 @@ def short_path(value, project):
     return value
 
 
-def change_sources(project, base_policy, extends):
+def change_sources(project, base_policy, extends, baseline=None):
     # Find where an effective entry came from: an extended group, the
-    # global config, or (None) the project file itself.
+    # global config, the project's "remove" (a global entry it drops), or
+    # (None) the project file itself. baseline: the global policy before
+    # project removals.
     layers = []
     snapshot = base_policy.get("_groups")
     if snapshot and extends:
@@ -1403,6 +1411,7 @@ def change_sources(project, base_policy, extends):
     empty = {"allowUnixSockets": [], "allowMachLookup": [], "allowRead": [], "allowWrite": [], "denyRead": [],
              "denyWrite": [], "remove": {}}
     global_summary = approval_summary(base_policy, empty)
+    unremoved = approval_summary(baseline, empty) if baseline is not None else global_summary
 
     def spellings(entry):
         text = entry["path"] if isinstance(entry, dict) else entry
@@ -1413,28 +1422,39 @@ def change_sources(project, base_policy, extends):
         except (RuntimeError, SystemExit, OSError):
             return {text}
 
-    def source(key, value):
+    def source(key, value, added=True):
         for name, layer in layers:
             if key == "switches":
                 found = layer.get("switches", {}).get(value) is True
+            elif key in ("path", "setEnv"):
+                found = value in layer.get("srtAgent", {}).get(key, [] if key == "path" else {})
             else:
                 section = "filesystem" if key in SRT_LISTS["filesystem"] else "network"
                 found = any(value in spellings(e) for e in layer.get(section, {}).get(key, []) or [])
             if found:
                 return "via group " + name
+        if not added and value in unremoved.get(key, []) and value not in global_summary.get(key, []):
+            return "project remove"
         if value in global_summary.get(key, []):
             return "global config"
         return None
     return source
 
 
+# Lists where order matters (lookup order, argument order, group order):
+# compared whole, so a reordering shows as a change.
+ORDERED_SETTINGS = ("path", "extends", "command", "binary")
+
+
 def flat_settings(value, prefix=""):
-    # {path: display}: lists become sets of members, so a reordering is no
-    # change and one added entry is one line.
+    # {path: display}: other lists become sets of members, so one added
+    # entry is one line.
     out = {}
     if isinstance(value, dict):
         for key, item in value.items():
             out.update(flat_settings(item, prefix + ("." if prefix else "") + str(key)))
+    elif isinstance(value, list) and prefix.rsplit(".", 1)[-1] in ORDERED_SETTINGS:
+        out[prefix] = json.dumps(value, ensure_ascii=True)
     elif isinstance(value, list):
         for item in value:
             out[prefix + "\0" + json.dumps(item, sort_keys=True, ensure_ascii=True)] = None
@@ -1465,16 +1485,21 @@ def settings_changes(old, new, skip, level_for):
     return changes
 
 
-def approval_changes(project, previous, data, grants, base_policy, project_ok=False, venv=None, venv_ok=True):
+def approval_changes(project, previous, data, grants, base_policy, project_ok=False, venv=None, venv_ok=True,
+                     baseline=None):
     # Everything the prompt lists, each {level, sign, text, note, source}.
+    # baseline: the global policy before this project's removals. A first
+    # approval compares against it, so a "remove" of an inherited block is
+    # shown as the block it removes.
     changes = []
     if not project_ok:
         empty = {"allowUnixSockets": [], "allowMachLookup": [], "remove": {}, "allowRead": [], "allowWrite": [],
                  "denyRead": [], "denyWrite": []}
-        old = previous.get("summary") if isinstance(previous.get("summary"), dict) else approval_summary(base_policy, empty)
+        old = previous.get("summary") if isinstance(previous.get("summary"), dict) else \
+            approval_summary(baseline if baseline is not None else base_policy, empty)
         new = approval_summary(base_policy, grants)
         extends = data.get("extends", []) if isinstance(data.get("extends"), list) else []
-        source = change_sources(project, base_policy, extends)
+        source = change_sources(project, base_policy, extends, baseline)
         for key, direction, _ in LOOSENING:
             before, after = set(old.get(key, [])), set(new.get(key, []))
             for value in sorted(after - before) + sorted(before - after):
@@ -1487,9 +1512,49 @@ def approval_changes(project, previous, data, grants, base_policy, project_ok=Fa
                     sign, text = ("+" if added else "-"), key + " " + json.dumps(short_path(value, project),
                                                                                 ensure_ascii=True)
                 changes.append({"level": level, "sign": sign, "text": text, "note": note,
-                                "source": source(key, value)})
+                                "source": source(key, value, added)})
         old_project = previous.get("configuration", {}) if isinstance(previous.get("configuration"), dict) else {}
         old_extends = old_project.get("extends", []) if isinstance(old_project.get("extends"), list) else []
+        # Launcher settings as merged with the groups. Records from before
+        # the summary held them fall back to the project file's own keys.
+        old_launcher = old.get("launcher") if isinstance(old.get("launcher"), dict) else {
+            "path": old_project.get("path", []), "setEnv": old_project.get("setEnv", {}),
+            "agentHome": old_project.get("agentHome")}
+        new_launcher = new["launcher"]
+        before_path, after_path = list(old_launcher.get("path") or []), new_launcher["path"]
+        for value in after_path:
+            if value not in before_path:
+                changes.append({"level": "medium", "sign": "+", "text": "path " + json.dumps(value, ensure_ascii=True),
+                                "note": "searched for commands, readable", "source": source("path", value)})
+        for value in before_path:
+            if value not in after_path:
+                changes.append({"level": "low", "sign": "-", "text": "path " + json.dumps(value, ensure_ascii=True),
+                                "note": None, "source": None})
+        common = [v for v in after_path if v in before_path]
+        if common != [v for v in before_path if v in after_path]:
+            changes.append({"level": "medium", "sign": "~", "text": "path order: " + json.dumps(
+                [v for v in before_path if v in after_path], ensure_ascii=True) + " → " + json.dumps(common, ensure_ascii=True),
+                "note": "decides which command runs", "source": None})
+        before_env, after_env = dict(old_launcher.get("setEnv") or {}), new_launcher["setEnv"]
+        for name in sorted(set(before_env) | set(after_env)):
+            if before_env.get(name) == after_env.get(name):
+                continue
+            label = "setEnv " + json.dumps(name, ensure_ascii=True) + ": "
+            if name not in after_env:
+                changes.append({"level": "low", "sign": "-", "text": label + json.dumps(before_env[name], ensure_ascii=True),
+                                "note": None, "source": None})
+                continue
+            text = (json.dumps(before_env[name], ensure_ascii=True) + " → " if name in before_env else "") \
+                + json.dumps(after_env[name], ensure_ascii=True)
+            changes.append({"level": "medium", "sign": "~" if name in before_env else "+", "text": label + text,
+                            "note": None, "source": source("setEnv", name)})
+        if old_launcher.get("agentHome") != new_launcher["agentHome"]:
+            changes.append({"level": "medium", "sign": "~", "text": "agentHome: " + json.dumps(
+                old_launcher.get("agentHome") or "isolated") + " → " + json.dumps(new_launcher["agentHome"] or "isolated"),
+                "note": "shared: this project's agents see each other's files", "source": None})
+        if set(extends) == set(old_extends) and extends != old_extends:
+            changes.append({"level": "low", "sign": "~", "text": "group order: " + json.dumps(old_extends) + " → "
+                            + json.dumps(extends), "note": "later groups win on setEnv", "source": None})
         # Shown as one header line; what a group grants is listed above,
         # marked "via group".
         for name in extends:
@@ -1505,7 +1570,9 @@ def approval_changes(project, previous, data, grants, base_policy, project_ok=Fa
             return "medium" if top in SENSITIVE_SETTINGS else "low"
         project_only = {k: v for k, v in data.items() if not k.startswith("(")}
         old_only = {k: v for k, v in old_project.items() if not k.startswith("(")}
-        changes += settings_changes(old_only, project_only, SUMMARIZED_SETTINGS + tuple(SWITCHES), level_for)
+        # Their effects are listed above: removals as the entries they drop.
+        changes += settings_changes(old_only, project_only, SUMMARIZED_SETTINGS + tuple(SWITCHES)
+                                    + ("path", "setEnv", "agentHome", "remove"), level_for)
         if isinstance(previous.get("base_configuration"), dict):
             for change in settings_changes(previous["base_configuration"], base_policy["configuration"],
                                            ("network", "filesystem", "allowPty") + tuple(SWITCHES), level_for):
@@ -1517,8 +1584,10 @@ def approval_changes(project, previous, data, grants, base_policy, project_ok=Fa
     if not venv_ok:
         changes.append({"level": "medium", "sign": "+", "text": "virtualenv " + json.dumps(venv["path"], ensure_ascii=True),
                         "note": "its bin goes first on the agent PATH; its files become readable", "source": None})
+    # Highest risk last: the end of the list sits right above the question,
+    # where it is still on screen.
     order = {level: index for index, level in enumerate(RISK_LEVELS)}
-    return sorted(changes, key=lambda c: order[c["level"]])
+    return sorted(changes, key=lambda c: -order[c["level"]])
 
 
 def paint(text, style, color):
@@ -1650,7 +1719,10 @@ def require_approval(project, path, raw, data, grants, base_policy, allow_home=F
             terminal.flush()
 
         color = not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
-        changes = approval_changes(project, previous, data, grants, base_policy, project_ok, venv, venv_ok)
+        # The global policy before this project's removals, for display:
+        # what the project's "remove" drops is shown as dropped.
+        baseline = None if project_ok else load_base_policy(project, base_policy["path"], allow_home=allow_home)
+        changes = approval_changes(project, previous, data, grants, base_policy, project_ok, venv, venv_ok, baseline)
         first = not project_ok and not isinstance(previous.get("summary"), dict)
         reason = "new virtualenv" if project_ok else ("first approval" if first else "settings changed")
         write(render_approval(project, reason, changes, color, first=first))
@@ -2349,9 +2421,9 @@ NOTIFY_EVENTS = {
     "failure": ("StopFailure", "{agent} stopped with an error in {project}"),
 }
 NOTIFY_MIN_INTERVAL = 3.0
-NOTIFY_MAX_SECONDS = 600  # a notification may wait this long for a click
+NOTIFY_MAX_SECONDS = 3600  # a notification (its whole process group) may wait this long for a click
 NOTIFY_KILL_GRACE = 5  # seconds between SIGTERM and SIGKILL for its process group
-NOTIFY_MAX_RUNNING = 4  # events arriving while this many still run are dropped
+NOTIFY_MAX_RUNNING = 4  # process groups at once; a new event replaces the oldest
 NOTIFY_LOG_SUMMARY = 60  # seconds; dropped lines are counted, logged at most this often
 NOTIFY_HOST_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMUX", "TMUX_PANE", "TMPDIR",
                    "__CFBundleIdentifier", "TERM_PROGRAM", "WEZTERM_PANE")
@@ -2433,7 +2505,7 @@ def start_notify_relay(command, temp, agent, project):
 
         log("relay started: agent=" + agent + " project=" + str(project) + " pane="
             + host_env.get("TMUX_PANE", "-") + " command=" + json.dumps(command))
-        running = []  # (process, started, word, error file)
+        running = []  # {process, started, word, errors, code}: one per process group
         # Lines the agent can produce at will are counted, not logged one by
         # one, so a flood cannot crowd real events out of the capped log.
         dropped, summarized = {}, [time.monotonic()]
@@ -2447,37 +2519,58 @@ def start_notify_relay(command, temp, agent, project):
                 dropped.clear()
                 summarized[0] = now
 
-        def reap(final=False):
-            # The program runs in its own session and may leave helpers
-            # (alerter) waiting for a click: never block on them, only on
-            # the time limit, after which its whole group is stopped.
-            for item in list(running):
-                process, started, word, errors = item
-                code = process.poll()
-                if code is None and (final or time.monotonic() - started > NOTIFY_MAX_SECONDS):
-                    for sig in (signal.SIGTERM, signal.SIGKILL):
-                        try:
-                            os.killpg(process.pid, sig)
-                        except OSError:
-                            pass
-                        try:
-                            code = process.wait(timeout=NOTIFY_KILL_GRACE)
-                            break
-                        except subprocess.TimeoutExpired:
-                            continue
-                    if code is None:
-                        continue  # unkillable (e.g. stuck in the kernel): retry on the next pass
-                    word += " (stopped after time limit)" if not final else " (session ended)"
-                if code is None:
-                    continue
-                running.remove(item)
+        def log_exit(item):
+            # Only the tail of what the program wrote to stderr is read.
+            errors = item["errors"]
+            try:
+                size = errors.seek(0, os.SEEK_END)
+                errors.seek(max(0, size - 2000))
+                text = errors.read().decode("utf-8", "replace").strip()
+                errors.close()
+            except (OSError, ValueError):
+                text = ""
+            log("event " + item["word"] + ": exit " + str(item["code"])
+                + ((" stderr: " + text.replace("\n", " | ")) if text else ""))
+
+        def alive(item):
+            # An entry lasts as long as its process group: the program and any
+            # helper it left behind (the bundled notifier's click helper stays
+            # in it), so the cap and the time limit cover those too. A group's
+            # id is not reused while the group exists.
+            if item["code"] is None:
+                item["code"] = item["process"].poll()
+                if item["code"] is not None:
+                    log_exit(item)
+            try:
+                os.killpg(item["process"].pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except OSError:
+                return True
+
+        def stop(item):
+            # SIGTERM, then SIGKILL, each with a grace period. Never waits
+            # longer than that, even on a process that cannot be killed.
+            for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
-                    errors.seek(0)
-                    text = errors.read()[-2000:].decode("utf-8", "replace").strip()
-                    errors.close()
+                    os.killpg(item["process"].pid, sig)
                 except OSError:
-                    text = ""
-                log("event " + word + ": exit " + str(code) + ((" stderr: " + text.replace("\n", " | ")) if text else ""))
+                    return
+                deadline = time.monotonic() + NOTIFY_KILL_GRACE
+                while alive(item) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if not alive(item):
+                    return
+
+        def reap(final=False):
+            for item in list(running):
+                if alive(item) and (final or time.monotonic() - item["started"] > NOTIFY_MAX_SECONDS):
+                    stop(item)
+                    log("event " + item["word"] + (": session ended, stopped" if final
+                                                     else ": stopped after time limit"))
+                if not alive(item):
+                    running.remove(item)
 
         while os.getppid() == parent:
             reap()
@@ -2501,7 +2594,12 @@ def start_notify_relay(command, temp, agent, project):
                     drop(word + " (rate-limited)")
                     continue
                 if len(running) >= NOTIFY_MAX_RUNNING:
-                    drop(word + " (" + str(NOTIFY_MAX_RUNNING) + " still running)")
+                    # The newest event wins: stop the oldest group to make room.
+                    stop(running[0])
+                    reap()
+                    drop("older notifications replaced by newer ones")
+                if len(running) >= NOTIFY_MAX_RUNNING:
+                    drop(word + " (" + str(NOTIFY_MAX_RUNNING) + " could not be stopped)")
                     continue
                 last[word] = now
                 hook_name, text = NOTIFY_EVENTS[word]
@@ -2521,7 +2619,8 @@ def start_notify_relay(command, temp, agent, project):
                     process = subprocess.Popen(command, stdin=data, stdout=subprocess.DEVNULL, stderr=errors,
                                                env=host_env, cwd="/", start_new_session=True, close_fds=True)
                     data.close()
-                    running.append((process, time.monotonic(), word, errors))
+                    running.append({"process": process, "started": time.monotonic(), "word": word, "errors": errors,
+                                    "code": None})
                     log("event " + word + ": started")
                 except (OSError, subprocess.SubprocessError) as error:
                     log("event " + word + ": could not run command: " + str(error))
@@ -4158,7 +4257,10 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
             if str(target) != approved:
                 fail("Project path " + entry + " now resolves to " + str(target) + ", not the approved "
                      + approved + "; review it again (srt-agent project approve)")
-        for spelled in (directory, target):
+            # Grant and search only that target, never the link spelling:
+            # a later retarget then reaches nothing.
+            directory = target
+        for spelled in dict.fromkeys((directory, target)):
             if spelled.is_relative_to(project) or account_home().is_relative_to(spelled):
                 fail("path (global or project) cannot add the project, your home or an ancestor: " + str(spelled))
             read_paths.append(str(spelled))

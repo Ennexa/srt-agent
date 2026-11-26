@@ -31,9 +31,9 @@ import sys
 
 ICON = "/Applications/Claude.app/Contents/Resources/electron.icns"
 TIMEOUT = 30  # seconds; only used when focusing a tmux pane can't clear the notification
-# The click helper outlives the relay's supervision (own session, so the
-# relay is not held up): it gives up on alerter after this long, even for
-# a persistent notification.
+# The click helper stays in this program's process group, so the relay
+# supervises it (counts it, stops it at its time limit). It also gives up on
+# alerter after this long by itself, even for a persistent notification.
 HELPER_DEADLINE = 3600
 # Absolute path for each program, or None to look it up on PATH.
 PROGRAMS = {"tmux": None, "lsappinfo": None, "alerter": None, "open": None,
@@ -192,8 +192,9 @@ def jump(pane, wezterm_pane):
 
 
 def notify(agent, msg, group, persistent, pane, wezterm_pane):
-    """Show the notification from a detached helper, so that the relay is not
-    held up; the helper waits for alerter and jumps to the agent on a click."""
+    """Show the notification from a forked helper, so that this program can
+    exit at once; the helper waits for alerter and jumps to the agent on a
+    click. It stays in our process group, where the relay still sees it."""
     path = program("alerter")
     if not path:
         say("notify: alerter not found on PATH")
@@ -211,8 +212,7 @@ def notify(agent, msg, group, persistent, pane, wezterm_pane):
     if child:
         say("notify: started %s, group %s%s" % (path, group, "" if persistent else ", timeout"))
         return
-    try:  # Helper: own session, no stdio shared with the relay.
-        os.setsid()
+    try:  # Helper: same process group (supervised by the relay), no stdio shared with it.
         null = os.open(os.devnull, os.O_RDWR)
         for fd in (0, 1, 2):
             os.dup2(null, fd)
