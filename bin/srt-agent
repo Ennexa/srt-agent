@@ -21,8 +21,8 @@ the file must be strict JSON with srt's list settings and switches only.
 Its switches (allowAppleEvents, enableWeakerNestedSandbox,
 enableWeakerNetworkIsolation, network.allowLocalBinding,
 network.allowAllUnixSockets) are the first layer: the global config,
-groups and the project may change them, and turning one on is asked
-about. allowPty may appear only as true. Any other key is refused, never
+groups and the project may change them (a project may turn on only
+allowLocalBinding), and turning one on is asked about. allowPty may appear only as true. Any other key is refused, never
 ignored. Approval binds its parsed content; it is shown in
 the approval diff and write-protected. Off by default. These are inherited
 DEFAULTS, not a floor: an approved project "remove" can drop any imported
@@ -171,7 +171,8 @@ refused for every launch, with the chain shown.
 Switches: allowLocalBinding and allowAllUnixSockets (in network),
 allowAppleEvents, enableWeakerNestedSandbox and enableWeakerNetworkIsolation
 may be set in the imported srt file, the global config, groups and project
-files; later layers win (project last), and --allow-local-binding turns
+files; later layers win (project last). A project file may turn on only
+allowLocalBinding; the others it may only turn off. --allow-local-binding turns
 local binding on for one launch. allowPty may appear only as true; proxy
 ports are never accepted. Project files may also list allowedDomains and
 deniedDomains.
@@ -1591,6 +1592,13 @@ def project_permissions(project, base_settings, allow_home=False):
     raw = read_regular(path)
     data = parse_jsonc(raw, str(path))  # shown in the approval diff as written
     flat = flat_layer(data, str(path), PROJECT_LAUNCHER_KEYS, ("remove", "extends"))
+    # The project file is written in the agent-writable repository. It may
+    # turn these off, but only your own config (global, groups, imported srt
+    # file) may turn them on: each lets code act outside the sandbox.
+    turned_on = sorted(k for k in HOST_ONLY_SWITCHES if flat.get("switches", {}).get(k) is True)
+    if turned_on:
+        fail(str(path) + ": " + ", ".join(turned_on) + " can be turned on only in the global config or a group, "
+             "not in a project file")
     effective = flat
     group_names = []
     group_domains = []
@@ -2157,6 +2165,10 @@ def start_notify_relay(command, temp, agent, project):
     # error output (capped), never anything the agent sent beyond the word.
     log_path = approval_directory().parent / "notify.log"
     host_env = {k: os.environ[k] for k in NOTIFY_HOST_ENV if k in os.environ}
+    # The program and the helpers it finds on PATH (tmux, alerter, ...) run
+    # unsandboxed: never resolve them from the agent-writable project, which
+    # direnv and the like put on the caller's PATH.
+    host_env["PATH"] = host_path(project)
     host_env.update({k: v for k, v in os.environ.items() if k.startswith("LC_")})
     if os.fork():
         os.close(reader)
@@ -2246,7 +2258,7 @@ def start_notify_relay(command, temp, agent, project):
                     data.seek(0)
                     errors = tempfile.TemporaryFile()
                     process = subprocess.Popen(command, stdin=data, stdout=subprocess.DEVNULL, stderr=errors,
-                                               env=host_env, start_new_session=True, close_fds=True)
+                                               env=host_env, cwd="/", start_new_session=True, close_fds=True)
                     data.close()
                     running.append((process, time.monotonic(), word, errors))
                     log("event " + word + ": started")
@@ -2395,6 +2407,9 @@ SWITCHES = {
     "enableWeakerNetworkIsolation": (None, "weaker network isolation"),
     "allowAppleEvents": (None, "agents may script other apps outside the sandbox"),
 }
+# Switches a project file may not turn on (see project_permissions).
+HOST_ONLY_SWITCHES = ("allowAllUnixSockets", "enableWeakerNestedSandbox", "enableWeakerNetworkIsolation",
+                      "allowAppleEvents")
 SRT_LISTS = {
     "network": ("allowedDomains", "deniedDomains", "allowUnixSockets", "allowMachLookup"),
     "filesystem": ("allowRead", "denyRead", "allowWrite", "denyWrite"),
@@ -3652,8 +3667,15 @@ def write_policy(directory, agent, data):
     return path
 
 
-def short_tmp(root, agent, target):
-    link = Path("/tmp") / ("sa-" + str(os.getuid()) + "-" + project_key(root)[:16] + "-" + agent)
+# Kinds of /tmp alias. The kind letter comes before the free-form name, so
+# no agent name can spell another kind's alias (an agent called "claude-srt"
+# once took over the host alias of "claude").
+TMP_ALIAS_KINDS = {"agent": "a", "host": "h", "messaging": "m"}
+
+
+def short_tmp(root, kind, name, target):
+    link = Path("/tmp") / ("sa-" + str(os.getuid()) + "-" + project_key(root)[:16] + "-" + TMP_ALIAS_KINDS[kind]
+                           + "-" + name)
     try:
         os.symlink(str(target), str(link))
     except FileExistsError:
@@ -3755,8 +3777,8 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     # read nor write (under the storage root, outside their grants), with
     # its own short alias for host-side Unix sockets. Never the agent's tmp.
     host_temp = private_dir(storage, Path("srt-tmp") / agent)
-    host_temp_link = short_tmp(project, agent + "-srt", host_temp)
-    temp_link = short_tmp(project, agent, temp)
+    host_temp_link = short_tmp(project, "host", agent, host_temp)
+    temp_link = short_tmp(project, "agent", agent, temp)
     # macOS spells /tmp as /private/tmp. Keep the final symlink component:
     # resolve() on the whole link would return its project-local target and
     # lose the short alias spelling that Seatbelt also needs to permit.
@@ -3778,7 +3800,7 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
         global_root = global_messaging_root(create=True)
         registry = private_dir(global_root, "sessions")
         sockets = private_dir(global_root, "sockets")
-        global_link = short_tmp(account_home(), "claude-msg", global_root)
+        global_link = short_tmp(account_home(), "messaging", "claude", global_root)
         canonical_link = global_link.parent.resolve() / global_link.name
         messaging_paths = list(dict.fromkeys(str(p) for p in (sockets, global_link / "sockets", canonical_link / "sockets")))
         messaging_filesystem_paths = [str(registry)] + messaging_paths
@@ -4016,11 +4038,32 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     # xcode-select stub: without DEVELOPER_DIR it reads the
     # /var/select/developer_dir link before the agent environment exists.
     # Hand it the same DEVELOPER_DIR the agent gets, so /var need not be
-    # readable.
-    if "DEVELOPER_DIR" in child_env:
-        env["DEVELOPER_DIR"] = child_env["DEVELOPER_DIR"]
+    # readable. srt and anything it starts run unsandboxed with this env, so
+    # an xcrun stub there would run tools from DEVELOPER_DIR on the host:
+    # pass it only when it names a root-owned, write-protected folder (a
+    # project setEnv could otherwise point it at a fake toolchain).
+    developer = child_env.get("DEVELOPER_DIR")
+    if developer:
+        try:
+            env["DEVELOPER_DIR"] = str(root_protected(Path(developer), directory=True))
+        except OSError as error:
+            print("srt-agent: warning: not passing DEVELOPER_DIR to srt (" + str(error) + "); host-side tools "
+                  "use xcode-select's choice instead", file=sys.stderr)
     return (srt, executable, policy_path, child_env, env, temp, messaging, profile, sorted(passed), path_dirs, venv,
             base_policy.get("tools"), agent_root, home_mode)
+
+
+def root_protected(path, directory=False):
+    # The resolved path, if it and every folder above it are root-owned and
+    # neither group nor others can write them; raises OSError otherwise.
+    real = path.resolve(strict=True)
+    for item in [real, *real.parents]:
+        info = item.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise PermissionError(str(item) + " is not root-owned and write-protected")
+    if directory and not real.is_dir():
+        raise NotADirectoryError(str(real) + " is not a folder")
+    return real
 
 
 def sandbox_python(child_env):
@@ -4035,11 +4078,7 @@ def sandbox_python(child_env):
         return "/usr/bin/python3"
     candidate = Path(developer) / "usr/bin/python3"
     try:
-        real = candidate.resolve(strict=True)
-        for item in [real, *real.parents]:
-            info = item.stat()
-            if info.st_uid != 0 or info.st_mode & 0o022:
-                raise PermissionError(str(item) + " is not root-owned and write-protected")
+        real = root_protected(candidate)
         if not stat.S_ISREG(real.stat().st_mode) or not os.access(real, os.X_OK):
             raise PermissionError(str(real) + " is not an executable file")
     except OSError as error:

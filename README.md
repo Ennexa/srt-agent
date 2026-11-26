@@ -333,7 +333,7 @@ Domains: wildcard entries like `*.github.com` cover subdomains. Domains go throu
 
 ## Switches
 
-srt's on/off settings may be set in any layer; later layers win (project last). Turning one on is asked about at approval.
+srt's on/off settings may be set in any layer; later layers win (project last). Turning one on is asked about at approval. A project file lives in the repository the agent can write, so it may turn on only `allowLocalBinding`. The other switches let code act outside the sandbox: a project file may turn them off, but only the global config, a group or the imported srt file may turn them on.
 
 | Switch | Where | Effect when on |
 |---|---|---|
@@ -540,7 +540,7 @@ log stream --style compact --predicate 'sender == "Sandbox"'
 ## macOS notes
 
 - **Homebrew.** `/opt/homebrew/bin`, `sbin`, `opt` and `Frameworks` hold links only; grant them globally so programs and libraries can be reached by their usual paths, and grant the real `Cellar/<formula>` folders per group. Do not grant `/opt/homebrew/lib` (global npm and pip packages live there), `/opt/homebrew/var` (service data: databases, logs), `Caskroom` as a whole, or `Library`.
-- **Developer tools.** `/usr/bin/python3`, `cc`, `ar` and friends are xcrun stubs. Set `DEVELOPER_DIR` globally (`/Library/Developer/CommandLineTools`) so they do not need `/var/select`; the launcher then also runs its in-sandbox wrapper with the real Python. The stubs still try to write a cache under `/var/folders` (`couldn't create cache file … xcrun_db`) — harmless noise. `lang/c` sets `CC`, `CXX`, `AR`, `RANLIB`, `NM`, `STRIP` and `SDKROOT` to the real tools and puts the toolchain folder on `PATH` (for `clangd`).
+- **Developer tools.** `/usr/bin/python3`, `cc`, `ar` and friends are xcrun stubs. Set `DEVELOPER_DIR` globally (`/Library/Developer/CommandLineTools`) so they do not need `/var/select`; the launcher then also runs its in-sandbox wrapper with the real Python. `srt` itself runs outside the sandbox, so it receives `DEVELOPER_DIR` only when the folder and every folder above it are root-owned and write-protected (a user-owned `/Applications/Xcode.app` doesn't qualify: the launcher warns and leaves it out). The stubs still try to write a cache under `/var/folders` (`couldn't create cache file … xcrun_db`) — harmless noise. `lang/c` sets `CC`, `CXX`, `AR`, `RANLIB`, `NM`, `STRIP` and `SDKROOT` to the real tools and puts the toolchain folder on `PATH` (for `clangd`).
 - **Do not grant `/var`.** It is `/private/var`, including every app's per-user temp and cache folders.
 - **AddressSanitizer works; lldb does not.** The ASan runtime ships with the Command Line Tools: `"$CC" -print-file-name=libclang_rt.asan_osx_dynamic.dylib`. To load a sanitized extension into an uninstrumented host such as Homebrew's `php`, run it with `DYLD_INSERT_LIBRARIES=<that path>`. lldb cannot attach to processes inside the sandbox; run it on the host. Crash reports in `~/Library/Logs/DiagnosticReports` can be granted read-only per project when needed.
 - **Language servers** are programs the agent starts inside the sandbox; generate groups for them (`srt-agent group create lsp/typescript --tool typescript-language-server --tool tsc`) and extend them from the matching `lang/` group.
