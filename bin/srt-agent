@@ -1285,7 +1285,10 @@ def project_identity(project, path, raw, grants, base_policy):
         "permissions_sha256": hashlib.sha256(
             json.dumps(grants, sort_keys=True, ensure_ascii=True).encode("utf-8")
         ).hexdigest(),
-        "base_policy": {key: value for key, value in base_policy.items() if key != "configuration"},
+        # "_" keys are the raw snapshots the launch is built from; what they
+        # mean for approval is bound through their summaries (template, ...).
+        "base_policy": {key: value for key, value in base_policy.items()
+                        if key != "configuration" and not key.startswith("_")},
     }
 
 
@@ -3079,13 +3082,14 @@ def validate_agents(agents):
 AGENT_GROUP_KEYS = {"network": ("allowedDomains",), "filesystem": ("allowRead",)}
 
 
-def agent_group(project, settings, agent):
+def agent_group(project, settings, agent, snapshot=None):
     # groups/agent/<agent>.jsonc, loaded automatically for that agent (and
     # whatever it extends). It extends the agent's entry in the global
     # config, so it may hold what that entry holds that makes sense in a
     # group: network.allowedDomains, filesystem.allowRead, path, setEnv.
     # Returns (merged group or None, ordered names, {file name: source}).
-    groups, sources = global_groups(project, settings, with_sources=True)
+    # snapshot: global_groups(..., with_sources=True) already read.
+    groups, sources = snapshot or global_groups(project, settings, with_sources=True)
     name = "agent/" + agent
     if name not in groups:
         return None, [], {}
@@ -3106,10 +3110,10 @@ def agent_group(project, settings, agent):
     return merge_layers(layers), order, {n: sources[n] for n in order if n in sources}
 
 
-def all_agent_groups(project, settings):
+def all_agent_groups(project, settings, snapshot=None):
     # Every agent group and what it reaches, for the global approval: like
     # an agents.<name> entry in config.jsonc, a change asks every project.
-    groups, sources = global_groups(project, settings, with_sources=True)
+    groups, sources = snapshot or global_groups(project, settings, with_sources=True)
     bound = {}
     for name in sorted(g for g in groups if g.startswith("agent/")):
         order = expand_groups([name], groups, group_directory(project, settings))
@@ -3628,11 +3632,16 @@ def load_base_policy(project, settings, allow_home=False, removals=None):
         "filesystem": filesystem,
         "switches": switches,
     }
-    template_bound, template_shown = template_summary(scan_template(project, settings))
+    # Read the template and the groups once. prepare() builds the launch
+    # from these same snapshots, so what was approved is what is copied and
+    # granted, never a second read made after the prompt.
+    policy["_template_scopes"] = scan_template(project, settings)
+    policy["_groups"] = global_groups(project, settings, with_sources=True)
+    template_bound, template_shown = template_summary(policy["_template_scopes"])
     if template_bound:
         policy["template"] = template_bound
         policy["configuration"] = {**policy["configuration"], "(template home)": template_shown}
-    agent_groups, agent_group_files = all_agent_groups(project, settings)
+    agent_groups, agent_group_files = all_agent_groups(project, settings, policy["_groups"])
     if agent_groups:
         policy["agent_groups"] = agent_groups
         policy["configuration"] = {**policy["configuration"], "(agent group files)": agent_group_files}
@@ -3673,9 +3682,11 @@ def write_policy(directory, agent, data):
 TMP_ALIAS_KINDS = {"agent": "a", "host": "h", "messaging": "m"}
 
 
-def short_tmp(root, kind, name, target):
+def short_tmp(root, kind, name, target, create=True):
     link = Path("/tmp") / ("sa-" + str(os.getuid()) + "-" + project_key(root)[:16] + "-" + TMP_ALIAS_KINDS[kind]
                            + "-" + name)
+    if not create:
+        return link
     try:
         os.symlink(str(target), str(link))
     except FileExistsError:
@@ -3692,8 +3703,14 @@ def short_tmp(root, kind, name, target):
 
 def prepare(agent, project, settings, allow_local_binding=False, require_project_approval=True, allow_home=False,
             allow_cross_session_messaging=None, custom_messaging_socket=False, activate_messaging=True,
-            requested_venv_mode=None):
+            requested_venv_mode=None, dry_run=False):
+    # dry_run (--show): build the same policy and environment, but create,
+    # write or install nothing; the policy comes back as a dict, not a file.
     agent = canonical_agent(agent)
+
+    def ensure(root, relative):
+        return Path(root) / relative if dry_run else private_dir(root, relative)
+
     requested_scope = None if allow_cross_session_messaging is None else messaging_scope(allow_cross_session_messaging)
     # Validate explicit opt-in before creating storage or temporary aliases.
     override_path, grants, project_data, project_raw = project_permissions(project, settings, allow_home=allow_home)
@@ -3702,7 +3719,7 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     profile = agent_profile(agent, options["agents"])
     # groups/agent/<agent>.jsonc: extends this agent's entry. The agent's
     # entry in config.jsonc wins on setEnv, being the more specific.
-    agent_extra, agent_groups_used, _ = agent_group(project, settings, agent)
+    agent_extra, agent_groups_used, _ = agent_group(project, settings, agent, base_policy["_groups"])
     profile["groups"] = agent_groups_used
     profile["notify"] = options.get("notify")
     profile.setdefault("path", [])
@@ -3730,17 +3747,17 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
                          allow_home=allow_home, venv=venv, mode=mode)
     executable = find_binary(profile["binary"], agent, project)
     srt = find_binary("srt", "srt", project)
-    storage = project_storage(project)
-    agent_root = private_dir(storage, Path("agents") / agent)
+    storage = project_storage_path(project) if dry_run else project_storage(project)
+    agent_root = ensure(storage, Path("agents") / agent)
     # isolated (default): agents/<agent>/home. shared: one shared/home for
     # this project's agents, a deliberate trust choice. Temp folders stay
     # per agent either way, and the modes use separate folders, so
     # switching never merges state.
     home_mode = grants.get("agentHome") or options.get("agentHome") or "isolated"
-    home_root = private_dir(storage, "shared") if home_mode == "shared" else agent_root
+    home_root = ensure(storage, "shared") if home_mode == "shared" else agent_root
     fresh_home = not (home_root / "home").is_dir()
-    home = private_dir(home_root, "home")
-    if fresh_home:
+    home = ensure(home_root, "home")
+    if fresh_home and not dry_run:
         other = ([storage / "shared/home"] if home_mode == "isolated" else
                  [entry / "home" for entry in (storage / "agents").iterdir() if (entry / "home").is_dir()])
         if any(path.is_dir() for path in other):
@@ -3751,24 +3768,28 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     # resolves inside THIS agent's home, so a codex run inside a Claude
     # session still never sees the codex agent's own credentials.
     homes = all_home_env(options["agents"])
-    for directory in [".config", ".cache", ".local/share", ".local/state", ".local/bin"] + list(homes.values()):
-        private_dir(home, directory)
-    install_tools_wrapper(home, base_policy.get("tools"))
-    template = template_for(scan_template(project, settings_name), agent, home_mode)
-    applied = apply_template(home, home_root / "template.json", template)
+    template = template_for(base_policy["_template_scopes"], agent, home_mode)
+    if dry_run:
+        applied = template  # what a launch would write
+    else:
+        for directory in [".config", ".cache", ".local/share", ".local/state", ".local/bin"] + list(homes.values()):
+            private_dir(home, directory)
+        install_tools_wrapper(home, base_policy.get("tools"))
+        applied = apply_template(home, home_root / "template.json", template)
     template_protected = [h / rel for h in dict.fromkeys((home, home.resolve()))
                           for rel, entry in template.items() if entry["kind"] != "seed"]
     template_reads = [entry["target"] for entry in template.values() if entry["kind"] == "link"]
     profile["template"] = sorted(applied)
-    temp = private_dir(agent_root, "tmp")
-    private_dir(temp, "run")
-    policy_dir = private_dir(approval_directory(create=True).parent, "policies/" + project_key(project))
+    temp = ensure(agent_root, "tmp")
+    ensure(temp, "run")
+    policy_dir = ensure(approval_directory(create=not dry_run).parent, "policies/" + project_key(project))
     # Agents get home and tmp, not agents/<name> itself: they cannot replace
     # either entry with a symlink, so the launcher's own walks from them stay
     # anchored.
     agent_paths = list(dict.fromkeys(p for d in (home, temp) for p in (d, d.resolve())))
+    existing_agents = (storage / "agents").iterdir() if (storage / "agents").is_dir() else ()
     sibling_agents = sorted((set(AGENTS) | set(options["agents"]) | {
-        entry.name for entry in (storage / "agents").iterdir() if entry.is_dir() and not entry.is_symlink()
+        entry.name for entry in existing_agents if entry.is_dir() and not entry.is_symlink()
     }) - {agent})
     if agent in sibling_agents or any(agent_root.is_relative_to(storage / "agents" / name) for name in sibling_agents):
         fail("Internal error: the running agent's own folder is in its write-deny list")
@@ -3776,9 +3797,9 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     # srt runs OUTSIDE the sandbox: give it a temp folder agents can neither
     # read nor write (under the storage root, outside their grants), with
     # its own short alias for host-side Unix sockets. Never the agent's tmp.
-    host_temp = private_dir(storage, Path("srt-tmp") / agent)
-    host_temp_link = short_tmp(project, "host", agent, host_temp)
-    temp_link = short_tmp(project, "agent", agent, temp)
+    host_temp = ensure(storage, Path("srt-tmp") / agent)
+    host_temp_link = short_tmp(project, "host", agent, host_temp, create=not dry_run)
+    temp_link = short_tmp(project, "agent", agent, temp, create=not dry_run)
     # macOS spells /tmp as /private/tmp. Keep the final symlink component:
     # resolve() on the whole link would return its project-local target and
     # lose the short alias spelling that Seatbelt also needs to permit.
@@ -3788,7 +3809,7 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     messaging_filesystem_paths = []
     messaging = {"enabled": scope != "off", "scope": scope, "directory": None, "registry": None}
     if scope == "project":
-        messaging_directory = private_dir(temp, "run/cc-socks")
+        messaging_directory = ensure(temp, "run/cc-socks")
         messaging_paths = list(dict.fromkeys(str(p) for p in (
             messaging_directory,
             temp_link / "run/cc-socks",
@@ -3797,10 +3818,10 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
         messaging["directory"] = str(temp_link / "run/cc-socks")
         messaging["registry"] = str(home / ".claude/sessions")
     elif scope == "global":
-        global_root = global_messaging_root(create=True)
-        registry = private_dir(global_root, "sessions")
-        sockets = private_dir(global_root, "sockets")
-        global_link = short_tmp(account_home(), "messaging", "claude", global_root)
+        global_root = global_messaging_root(create=not dry_run)
+        registry = ensure(global_root, "sessions")
+        sockets = ensure(global_root, "sockets")
+        global_link = short_tmp(account_home(), "messaging", "claude", global_root, create=not dry_run)
         canonical_link = global_link.parent.resolve() / global_link.name
         messaging_paths = list(dict.fromkeys(str(p) for p in (sockets, global_link / "sockets", canonical_link / "sockets")))
         messaging_filesystem_paths = [str(registry)] + messaging_paths
@@ -3876,10 +3897,11 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
     merged_set_env = {**options.get("setEnv", {}), **project_launcher.get("setEnv", {}), **profile["setEnv"]}
     if any(uses_cache(value) for value in merged_set_env.values()):
         caches = account_home() / "Library/Caches"
-        caches.mkdir(parents=True, exist_ok=True)
+        if not dry_run:
+            caches.mkdir(parents=True, exist_ok=True)
         # private_dir tightens every component it walks: start at Caches so
         # only srt-agent/<project> (ours) is created and chmod 0700.
-        cache = private_dir(caches, Path("srt-agent") / project_cache_dir(project).name)
+        cache = ensure(caches, Path("srt-agent") / project_cache_dir(project).name)
         cache_paths = list(dict.fromkeys([cache, cache.resolve()]))
         read_paths += [str(p) for p in cache_paths]
     for read_path in read_paths:
@@ -3975,7 +3997,7 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
                          + text)
     refuse_ineffective_read_blocks(policy["filesystem"]["allowRead"],
                                    list(base_policy["filesystem"].get("denyRead", [])) + list(grants["denyRead"]))
-    policy_path = write_policy(policy_dir, agent, policy)
+    policy_path = policy if dry_run else write_policy(policy_dir, agent, policy)
     child_env = {variable: str(home / relative) for variable, relative in homes.items()}
     child_env.update({
         "HOME": str(home),
@@ -4014,7 +4036,7 @@ def prepare(agent, project, settings, allow_local_binding=False, require_project
             # Must exist before tools use it; O_NOFOLLOW walk, so a symlink
             # planted in the agent-writable cache cannot redirect the mkdir.
             if rest:
-                private_dir(cache, rest)
+                ensure(cache, rest)
         child_env[name] = expand_env_value(value, project)
         if name == "TMPDIR":
             # Keep the aliases consistent for tools that read TMP/TEMP.
@@ -4285,6 +4307,7 @@ def main(argv=None):
         # exec runs no agent session, so leave Claude's registry untouched.
         activate_messaging=not args.show and args.command == "run",
         requested_venv_mode=args.venv_mode,
+        dry_run=args.show,
     )
     messaging_directory = messaging["directory"]
     if args.command == "exec":
@@ -4305,7 +4328,8 @@ def main(argv=None):
             if flag not in agent_args:
                 agent_args = [flag] + agent_args
     python = sandbox_python(child_env)
-    prefix = [srt, "--settings", str(policy), "--", python, "-I", "-c"]
+    # With --show, policy is the dict a launch would write to a fresh file.
+    prefix = [srt, "--settings", "<policy file written at launch>" if args.show else str(policy), "--", python, "-I", "-c"]
     if args.command == "exec":
         command = prefix + [EXEC_CODE] + agent_args
     else:
@@ -4333,8 +4357,7 @@ def main(argv=None):
     elif not args.no_pty_isolation and not args.show:
         env["SRT_AGENT_PTY"] = "1"
     if args.show:
-        with policy.open() as handle:
-            effective = json.load(handle)
+        effective = policy
         print(json.dumps({"project": str(project), "agent": args.agent, "temporary_files": str(temp),
                           "cross_session_messaging": messaging, "virtual_env": venv, "tools_venv": tools,
                           "agent_storage": str(agent_root), "agent_groups": profile.get("groups", []),

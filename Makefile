@@ -1,5 +1,5 @@
 # Run on the host, never inside a sandbox: install uses sudo.
-#   make test      run the notifier tests
+#   make test      run the notifier and launcher tests
 #   make diff      show what install would change
 #   make install   copy the programs root-owned into /usr/local
 PREFIX = /usr/local
@@ -10,6 +10,7 @@ LIBEXEC = srt-agent-notify
 
 test:
 	/usr/bin/python3 -I tests/test_srt_agent_notify.py
+	/usr/bin/python3 -I tests/test_srt_agent_launcher.py
 
 diff:
 	-@for f in $(BIN); do diff -u $(PREFIX)/bin/$$f bin/$$f; done

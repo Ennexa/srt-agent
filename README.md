@@ -301,7 +301,7 @@ A link to a file inside the template is followed and copied, so one file can ser
 - **Shared homes:** with `"agentHome": "shared"`, two agents' folders may not both contain the same path.
 - **Safety:** writes into the agent home go through descriptors that never follow links, so a link planted by an agent stops the launch. The template folder is write-protected inside the sandbox.
 - **Approval:** the template is part of the global settings; changing it asks every project again. For a link only the link is approved; its target's content is live.
-- **Checking:** `srt-agent run --show claude | jq '.template_files'`. An agent's home in a project appears the first time it runs there (`--show` counts).
+- **Checking:** `srt-agent run --show claude | jq '.template_files'`. An agent's home in a project appears the first time it runs there. `--show` lists the files a launch would write but changes nothing on disk: no folders, links, template files or policy file.
 
 Example — one real instructions file for all agents, plus notes only sandboxed agents see:
 
@@ -428,7 +428,7 @@ srt-agent group update NAME
 
 | Option | Meaning |
 |---|---|
-| `--show` | print the effective policy, environment, groups and template files; launch nothing |
+| `--show` | print the effective policy, environment, groups and template files; launch and write nothing |
 | `--check` | test the protections inside srt without starting an agent |
 | `-l`, `--allow-local-binding` | allow listeners and localhost for this launch |
 | `--allow-home` | permit home launches and approved home-wide reads for this launch |
