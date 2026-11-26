@@ -291,12 +291,45 @@ class ApprovalPromptTest(unittest.TestCase):
         settings = self.config / "config.jsonc"
         _, grants, data, _ = self.sa.project_permissions(self.project, settings)
         policy = self.sa.load_base_policy(self.project, settings, removals=grants["remove"])
-        baseline = self.sa.load_base_policy(self.project, settings)
-        changes = self.sa.approval_changes(self.project, {}, data, grants, policy, baseline=baseline)
+        changes = self.sa.approval_changes(self.project, {}, data, grants, policy)
         block = self.find(changes, "denyWrite")
         self.assertEqual((block["level"], block["sign"], block["source"]), ("high", "-", "project remove"))
         self.assertEqual(self.find(changes, "evil.example")["level"], "medium")
         self.assertFalse([c for c in changes if "remove" in c["text"]])  # shown by effect, not as remove.*
+
+    def test_removing_a_grant_launch_checks_refuse_does_not_block_the_prompt(self):
+        # A whole-home read needs --allow-home; removed by the project, the
+        # launch is fine, and so must be the prompt that describes it.
+        (self.config / "config.jsonc").write_text(json.dumps({
+            "network": {"allowedDomains": ["example.com"]}, "filesystem": {"allowRead": ["~"]}}))
+        self.write_project({"remove": {"filesystem": {"allowRead": ["~"]}}})
+        settings = self.config / "config.jsonc"
+        _, grants, data, _ = self.sa.project_permissions(self.project, settings)
+        policy = self.sa.load_base_policy(self.project, settings, removals=grants["remove"])
+        changes = self.sa.approval_changes(self.project, {}, data, grants, policy)
+        home = self.find(changes, "allowRead")
+        self.assertEqual((home["level"], home["sign"], home["source"]), ("low", "-", "project remove"))
+
+    def test_effective_home_mode_is_compared(self):
+        config = json.loads((self.config / "config.jsonc").read_text())
+        config["agentHome"] = "shared"
+        (self.config / "config.jsonc").write_text(json.dumps(config))
+        changes = self.changes({"agentHome": "isolated"}, {})
+        home = self.find(changes, "agentHome")
+        self.assertEqual(home["text"], 'agentHome: "isolated" → "shared"')
+        self.assertEqual((home["level"], home["source"]), ("medium", "global config"))
+        self.assertIn("credentials", home["note"])
+        self.assertEqual(self.find(self.changes({}, {"agentHome": "isolated"}), "agentHome")["level"], "low")
+
+    def test_setenv_is_credited_to_the_layer_that_wins(self):
+        config = json.loads((self.config / "config.jsonc").read_text())
+        config["groups"]["tools"] = {"setEnv": {"TOOL_MODE": "fast"}}
+        config["groups"]["tools-late"] = {"setEnv": {"TOOL_MODE": "late"}}
+        (self.config / "config.jsonc").write_text(json.dumps(config))
+        own = self.find(self.changes({}, {"extends": ["tools"], "setEnv": {"TOOL_MODE": "slow"}}), "TOOL_MODE")
+        self.assertEqual((own["text"], own["source"]), ('setEnv "TOOL_MODE": "slow"', None))
+        later = self.find(self.changes({}, {"extends": ["tools", "tools-late"]}), "TOOL_MODE")
+        self.assertEqual((later["text"], later["source"]), ('setEnv "TOOL_MODE": "late"', "via group tools-late"))
 
     def test_group_launcher_settings_are_shown_in_order(self):
         (self.home / "tools/a").mkdir(parents=True)
@@ -375,6 +408,15 @@ class NotifyRelayTest(unittest.TestCase):
         log = self.wait_for(": started", count=5)
         self.wait_for("older notifications replaced by newer ones")
         self.assertIn("event " + words[0] + ": exit", log + self.log.read_text())
+
+    def test_stderr_capture_is_bounded_on_disk(self):
+        self.sa.NOTIFY_MAX_FILE = 64 * 1024
+        writer = self.start("head -c 10000000 /dev/zero >&2\necho done >&2\n")
+        os.write(writer, b"stop\n")
+        log = self.wait_for("event stop: exit")
+        line = [l for l in log.splitlines() if "event stop: exit" in l][0]
+        self.assertLess(len(line), 2300)  # tail only
+        self.assertNotIn("done", line)  # writing stopped at the limit (unbounded, "done" would be the tail)
 
     def test_helpers_left_behind_count_until_they_end(self):
         self.sa.NOTIFY_MAX_SECONDS = 1

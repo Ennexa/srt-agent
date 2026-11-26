@@ -443,6 +443,7 @@ import os
 import pwd
 from pathlib import Path
 import re
+import resource
 import shlex
 import shutil
 import select
@@ -1332,7 +1333,9 @@ def approval_summary(base_policy, grants):
     # PATH order decides which command runs.
     launcher = grants.get("launcher", {})
     summary["launcher"] = {"path": list(launcher.get("path", [])), "setEnv": dict(launcher.get("setEnv", {})),
-                           "agentHome": grants.get("agentHome")}
+                           # effective, as prepare() picks it
+                           "agentHome": grants.get("agentHome") or base_policy["launcher_options"].get("agentHome")
+                           or "isolated"}
     return summary
 
 
@@ -1394,11 +1397,11 @@ def short_path(value, project):
     return value
 
 
-def change_sources(project, base_policy, extends, baseline=None):
+def change_sources(project, base_policy, extends, own=None):
     # Find where an effective entry came from: an extended group, the
     # global config, the project's "remove" (a global entry it drops), or
-    # (None) the project file itself. baseline: the global policy before
-    # project removals.
+    # (None) the project file itself. own: the project file's settings.
+    own = own or {}
     layers = []
     snapshot = base_policy.get("_groups")
     if snapshot and extends:
@@ -1411,7 +1414,7 @@ def change_sources(project, base_policy, extends, baseline=None):
     empty = {"allowUnixSockets": [], "allowMachLookup": [], "allowRead": [], "allowWrite": [], "denyRead": [],
              "denyWrite": [], "remove": {}}
     global_summary = approval_summary(base_policy, empty)
-    unremoved = approval_summary(baseline, empty) if baseline is not None else global_summary
+    removed = base_policy.get("_removed", {})
 
     def spellings(entry):
         text = entry["path"] if isinstance(entry, dict) else entry
@@ -1423,18 +1426,27 @@ def change_sources(project, base_policy, extends, baseline=None):
             return {text}
 
     def source(key, value, added=True):
+        if key == "setEnv":
+            # Later layers win: the project file over its groups, a later
+            # group over an earlier one. Credit the layer whose value is used.
+            if value in (own.get("setEnv") or {}):
+                return None
+            for name, layer in reversed(layers):
+                if value in layer.get("srtAgent", {}).get("setEnv", {}):
+                    return "via group " + name
+            return None
+        if not added and value in removed.get(key, []):
+            return "project remove"
         for name, layer in layers:
             if key == "switches":
                 found = layer.get("switches", {}).get(value) is True
-            elif key in ("path", "setEnv"):
-                found = value in layer.get("srtAgent", {}).get(key, [] if key == "path" else {})
+            elif key == "path":
+                found = value in layer.get("srtAgent", {}).get("path", [])
             else:
                 section = "filesystem" if key in SRT_LISTS["filesystem"] else "network"
                 found = any(value in spellings(e) for e in layer.get(section, {}).get(key, []) or [])
             if found:
                 return "via group " + name
-        if not added and value in unremoved.get(key, []) and value not in global_summary.get(key, []):
-            return "project remove"
         if value in global_summary.get(key, []):
             return "global config"
         return None
@@ -1485,21 +1497,25 @@ def settings_changes(old, new, skip, level_for):
     return changes
 
 
-def approval_changes(project, previous, data, grants, base_policy, project_ok=False, venv=None, venv_ok=True,
-                     baseline=None):
+def approval_changes(project, previous, data, grants, base_policy, project_ok=False, venv=None, venv_ok=True):
     # Everything the prompt lists, each {level, sign, text, note, source}.
-    # baseline: the global policy before this project's removals. A first
-    # approval compares against it, so a "remove" of an inherited block is
-    # shown as the block it removes.
     changes = []
     if not project_ok:
         empty = {"allowUnixSockets": [], "allowMachLookup": [], "remove": {}, "allowRead": [], "allowWrite": [],
                  "denyRead": [], "denyWrite": []}
-        old = previous.get("summary") if isinstance(previous.get("summary"), dict) else \
-            approval_summary(baseline if baseline is not None else base_policy, empty)
+        if isinstance(previous.get("summary"), dict):
+            old = previous["summary"]
+        else:
+            # First approval: the global policy as inherited, i.e. with what
+            # the project's "remove" drops put back, so each removal shows as
+            # the entry it drops. Same snapshot as the launch; display only.
+            old = approval_summary(base_policy, empty)
+            for key, entries in base_policy.get("_removed", {}).items():
+                if key in old:
+                    old[key] = sorted(set(old[key]) | set(entries))
         new = approval_summary(base_policy, grants)
         extends = data.get("extends", []) if isinstance(data.get("extends"), list) else []
-        source = change_sources(project, base_policy, extends, baseline)
+        source = change_sources(project, base_policy, extends, data)
         for key, direction, _ in LOOSENING:
             before, after = set(old.get(key, [])), set(new.get(key, []))
             for value in sorted(after - before) + sorted(before - after):
@@ -1548,10 +1564,17 @@ def approval_changes(project, previous, data, grants, base_policy, project_ok=Fa
                 + json.dumps(after_env[name], ensure_ascii=True)
             changes.append({"level": "medium", "sign": "~" if name in before_env else "+", "text": label + text,
                             "note": None, "source": source("setEnv", name)})
-        if old_launcher.get("agentHome") != new_launcher["agentHome"]:
-            changes.append({"level": "medium", "sign": "~", "text": "agentHome: " + json.dumps(
-                old_launcher.get("agentHome") or "isolated") + " → " + json.dumps(new_launcher["agentHome"] or "isolated"),
-                "note": "shared: this project's agents see each other's files", "source": None})
+        # Effective home modes (project, else global, else isolated). Older
+        # records stored only the project's own setting.
+        before_home = old_launcher.get("agentHome") or base_policy["launcher_options"].get("agentHome") or "isolated"
+        after_home = new_launcher["agentHome"]
+        if before_home != after_home:
+            shared = after_home == "shared"
+            changes.append({"level": "medium" if shared else "low", "sign": "~",
+                            "text": "agentHome: " + json.dumps(before_home) + " → " + json.dumps(after_home),
+                            "note": ("this project's agents share one home: each can read the others' credentials "
+                                     "and sessions" if shared else "tightens"),
+                            "source": None if grants.get("agentHome") else "global config"})
         if set(extends) == set(old_extends) and extends != old_extends:
             changes.append({"level": "low", "sign": "~", "text": "group order: " + json.dumps(old_extends) + " → "
                             + json.dumps(extends), "note": "later groups win on setEnv", "source": None})
@@ -1574,8 +1597,10 @@ def approval_changes(project, previous, data, grants, base_policy, project_ok=Fa
         changes += settings_changes(old_only, project_only, SUMMARIZED_SETTINGS + tuple(SWITCHES)
                                     + ("path", "setEnv", "agentHome", "remove"), level_for)
         if isinstance(previous.get("base_configuration"), dict):
+            # agentHome: listed above as the effective mode.
             for change in settings_changes(previous["base_configuration"], base_policy["configuration"],
-                                           ("network", "filesystem", "allowPty") + tuple(SWITCHES), level_for):
+                                           ("network", "filesystem", "allowPty", "agentHome") + tuple(SWITCHES),
+                                           level_for):
                 change["source"] = "global config"
                 changes.append(change)
         if not changes:
@@ -1610,7 +1635,7 @@ def render_approval(project, reason, changes, color, first=False):
                        "bold", color)
     out += " (" + reason + ")\n"
     if first:
-        out += "  First approval: compared with your global settings, which are the baseline.\n"
+        out += "  First approval: compared with your global settings as inherited (before this project's remove).\n"
     groups = [c for c in changes if c.get("kind") == "group"]
     if groups:
         out += "  Groups: " + ", ".join(c["sign"] + " " + json.dumps(c["text"], ensure_ascii=True) for c in groups) + "\n"
@@ -1719,10 +1744,7 @@ def require_approval(project, path, raw, data, grants, base_policy, allow_home=F
             terminal.flush()
 
         color = not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
-        # The global policy before this project's removals, for display:
-        # what the project's "remove" drops is shown as dropped.
-        baseline = None if project_ok else load_base_policy(project, base_policy["path"], allow_home=allow_home)
-        changes = approval_changes(project, previous, data, grants, base_policy, project_ok, venv, venv_ok, baseline)
+        changes = approval_changes(project, previous, data, grants, base_policy, project_ok, venv, venv_ok)
         first = not project_ok and not isinstance(previous.get("summary"), dict)
         reason = "new virtualenv" if project_ok else ("first approval" if first else "settings changed")
         write(render_approval(project, reason, changes, color, first=first))
@@ -2425,6 +2447,14 @@ NOTIFY_MAX_SECONDS = 3600  # a notification (its whole process group) may wait t
 NOTIFY_KILL_GRACE = 5  # seconds between SIGTERM and SIGKILL for its process group
 NOTIFY_MAX_RUNNING = 4  # process groups at once; a new event replaces the oldest
 NOTIFY_LOG_SUMMARY = 60  # seconds; dropped lines are counted, logged at most this often
+# Largest file the program (and its helpers) may write, its captured stderr
+# included; past it the writer gets SIGXFSZ. Notifiers write next to nothing.
+NOTIFY_MAX_FILE = 4 * 1024 * 1024
+
+
+def limit_notify_files():
+    # preexec_fn for the notify program: the relay is single-threaded.
+    resource.setrlimit(resource.RLIMIT_FSIZE, (NOTIFY_MAX_FILE, NOTIFY_MAX_FILE))
 NOTIFY_HOST_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMUX", "TMUX_PANE", "TMPDIR",
                    "__CFBundleIdentifier", "TERM_PROGRAM", "WEZTERM_PANE")
 
@@ -2617,7 +2647,8 @@ def start_notify_relay(command, temp, agent, project):
                     data.seek(0)
                     errors = tempfile.TemporaryFile()
                     process = subprocess.Popen(command, stdin=data, stdout=subprocess.DEVNULL, stderr=errors,
-                                               env=host_env, cwd="/", start_new_session=True, close_fds=True)
+                                               env=host_env, cwd="/", start_new_session=True, close_fds=True,
+                                               preexec_fn=limit_notify_files)
                     data.close()
                     running.append({"process": process, "started": time.monotonic(), "word": word, "errors": errors,
                                     "code": None})
@@ -3713,6 +3744,27 @@ def validate_removals(removals):
     return result
 
 
+def removed_entries(project, removals):
+    # {list name: [entries]} in the approval summary's spelling, for the
+    # entries a project's "remove" drops from the global policy. Display
+    # only: they never run, so launch checks (e.g. whole-home grants need
+    # --allow-home) do not apply, and a spelling the normal path refuses
+    # falls back to the plain resolved path.
+    out = {}
+    for section, lists in removals.items():
+        for name, targets in lists.items():
+            if section != "filesystem":
+                out[name] = list(targets)
+                continue
+            try:
+                entries = global_filesystem(project, {name: targets}, allow_home=True).get(name, [])
+                out[name] = [e["path"] if isinstance(e, dict) else e for e in entries]
+            except (RuntimeError, OSError):
+                out[name] = [str(resolve_project_path(project, t["path"] if isinstance(t, dict) else t, False))
+                             for t in targets]
+    return out
+
+
 def remove_global_entries(configuration, removals):
     # Match the original spelling and type: a glob here selects the global
     # rule itself, never files matching it. Work on a copy, not source data.
@@ -3955,6 +4007,7 @@ def load_base_policy(project, settings, allow_home=False, removals=None):
         fail("Settings must contain a network object; refusing a policy fallback")
     removals = validate_removals({} if removals is None else removals)
     effective = remove_global_entries(merged, removals)
+    removed = removed_entries(project, removals)
     effective.pop("switches", None)
     launcher_options = effective.pop("srtAgent", {})
     messaging_default = messaging_scope(launcher_options.get("crossSessionMessaging", "off"))
@@ -3992,6 +4045,8 @@ def load_base_policy(project, settings, allow_home=False, removals=None):
         "filesystem": filesystem,
         "switches": switches,
     }
+    # For the approval prompt only: what the project's "remove" drops.
+    policy["_removed"] = removed
     # Read the template and the groups once. prepare() builds the launch
     # from these same snapshots, so what was approved is what is copied and
     # granted, never a second read made after the prompt.
