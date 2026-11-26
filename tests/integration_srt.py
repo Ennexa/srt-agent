@@ -5,6 +5,7 @@ required access works and forbidden access fails.
 Run on the host, never inside a sandbox (sandboxes do not nest):
     make integration
     SRT_AGENT_INTEGRATION_NETWORK=0 make integration   # skip the network probes
+    SRT_AGENT_INTEGRATION_NETWORK=only make integration   # run only those
     SRT_AGENT_SRT_VERSION=x.y.z make integration       # also pin the srt version
 
 Uses a scratch account home (config, approvals, agent storage) under $TMPDIR,
@@ -25,7 +26,15 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "srt-agent"
 AGENT = "probe"
-NETWORK = os.environ.get("SRT_AGENT_INTEGRATION_NETWORK", "1") != "0"
+# "1" (default): every probe; "0": no network probes; "only": just those.
+NETWORK = os.environ.get("SRT_AGENT_INTEGRATION_NETWORK", "1")
+
+
+def network(test):
+    # Marks a probe that needs internet access (it reaches real sites).
+    test = unittest.skipIf(NETWORK == "0", "SRT_AGENT_INTEGRATION_NETWORK=0")(test)
+    test.network = True
+    return test
 STARTED = "srt-agent-probe-started"
 
 
@@ -109,6 +118,8 @@ class SeatbeltTest(unittest.TestCase):
         shutil.rmtree(cls.base, ignore_errors=True)
 
     def setUp(self):
+        if NETWORK == "only" and not getattr(getattr(self, self._testMethodName), "network", False):
+            self.skipTest("SRT_AGENT_INTEGRATION_NETWORK=only")
         self.write_project({})
 
     def write_project(self, extra):
@@ -224,19 +235,19 @@ class SeatbeltTest(unittest.TestCase):
 
     # Network: no direct connections; only allowed domains, through srt's proxy.
 
-    @unittest.skipUnless(NETWORK, "SRT_AGENT_INTEGRATION_NETWORK=0")
+    @network
     def test_direct_connections_are_refused(self):
         self.refused("/usr/bin/curl -sS --noproxy '*' --max-time 10 -o /dev/null https://1.1.1.1")
 
-    @unittest.skipUnless(NETWORK, "SRT_AGENT_INTEGRATION_NETWORK=0")
+    @network
     def test_an_allowed_domain_works_through_the_proxy(self):
         self.allowed("/usr/bin/curl -sS --fail --max-time 30 -o /dev/null https://example.com")
 
-    @unittest.skipUnless(NETWORK, "SRT_AGENT_INTEGRATION_NETWORK=0")
+    @network
     def test_other_domains_are_refused(self):
         self.refused("/usr/bin/curl -sS --fail --max-time 30 -o /dev/null https://example.net")
 
-    @unittest.skipUnless(NETWORK, "SRT_AGENT_INTEGRATION_NETWORK=0")
+    @network
     def test_an_extended_group_grants_its_domains(self):
         self.refused("/usr/bin/curl -sS --fail --max-time 30 -o /dev/null https://example.org")
         self.write_project({"extends": ["data"]})
