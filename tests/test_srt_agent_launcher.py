@@ -180,6 +180,111 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(env["DEVELOPER_DIR"], str(COMMAND_LINE_TOOLS.resolve()))
 
 
+class ApprovalPromptTest(unittest.TestCase):
+    """The approval summary and its steps, without a terminal."""
+
+    write_project = LauncherTest.write_project
+
+    def setUp(self):
+        LauncherTest.setUp(self)  # same scratch home, without rerunning its tests
+        (self.home / "notes").mkdir()
+        (self.config / "config.jsonc").write_text(json.dumps({
+            "network": {"allowedDomains": ["example.com"]},
+            "groups": {
+                "docker": {"network": {"allowAllUnixSockets": True,
+                                       "allowUnixSockets": ["~/.docker/run/docker.sock"]}},
+                "lang/node": {"network": {"allowedDomains": ["registry.npmjs.org"]}},
+            }}))
+
+    def state(self, project_data):
+        self.write_project(project_data)
+        settings = self.config / "config.jsonc"
+        _, grants, data, _ = self.sa.project_permissions(self.project, settings)
+        return grants, data, self.sa.load_base_policy(self.project, settings, removals=grants["remove"])
+
+    def changes(self, before, after):
+        grants, data, policy = self.state(before)
+        previous = {"configuration": data, "base_configuration": policy["configuration"],
+                    "summary": self.sa.approval_summary(policy, grants)}
+        grants, data, policy = self.state(after)
+        return self.sa.approval_changes(self.project, previous, data, grants, policy)
+
+    def find(self, changes, text):
+        found = [c for c in changes if text in c["text"]]
+        self.assertEqual(len(found), 1, text + " in " + repr(changes))
+        return found[0]
+
+    def steps(self, changes, answers):
+        replies, output, details = iter(answers), [], []
+        accepted = self.sa.approval_steps(changes, lambda: next(replies, ""), output.append,
+                                          lambda: details.append(1), False)
+        return accepted, "".join(output), len(details)
+
+    def test_changes_are_ranked_by_what_they_grant_and_attributed(self):
+        changes = self.changes({"filesystem": {"allowWrite": ["./out"]}},
+                               {"extends": ["docker", "lang/node"], "setEnv": {"FOO": "1"},
+                                "filesystem": {"allowRead": ["~/notes"]}})
+        switch = self.find(changes, "allowAllUnixSockets")
+        self.assertEqual((switch["level"], switch["source"]), ("high", "via group docker"))
+        self.assertEqual(self.find(changes, "docker.sock")["level"], "high")
+        domain = self.find(changes, "registry.npmjs.org")
+        self.assertEqual((domain["level"], domain["source"]), ("medium", "via group lang/node"))
+        self.assertEqual(self.find(changes, '"~/notes"')["level"], "medium")
+        self.assertEqual(self.find(changes, "setEnv.FOO")["level"], "medium")
+        self.assertEqual(self.find(changes, '"./out"')["level"], "low")  # removed: tightens
+        self.assertEqual([c["level"] for c in changes], sorted((c["level"] for c in changes),
+                                                               key=self.sa.RISK_LEVELS.index))
+        text = self.sa.render_approval(self.project, "settings changed", changes, False)
+        self.assertIn('Groups: + "docker", + "lang/node"', text)
+
+    def test_write_inside_the_project_is_low_outside_high(self):
+        changes = self.changes({}, {"filesystem": {"allowWrite": ["./out"]}})
+        self.assertEqual(self.find(changes, '"./out"')["level"], "low")
+        # Projects cannot grant writes outside themselves; the global config can.
+        level, _ = self.sa.change_risk("allowWrite", True, str(self.home / "notes"), self.project)
+        self.assertEqual(level, "high")
+
+    def test_high_risk_needs_yes_spelled_out_each_time(self):
+        changes = self.changes({}, {"extends": ["docker", "lang/node"]})
+        self.assertFalse(self.steps(changes, ["yes", "y"])[0])  # second high change: y is not enough
+        accepted, output, _ = self.steps(changes, ["yes", "yes", "y"])
+        self.assertTrue(accepted)
+        self.assertIn("HIGH-RISK change 2 of 2", output)
+        self.assertIn("Approve the other changes", output)
+
+    def test_only_high_risk_changes_skip_the_final_step(self):
+        changes = self.changes({"extends": ["lang/node"]}, {"extends": ["lang/node", "docker"]})
+        changes = [c for c in changes if c.get("kind") != "group"]
+        accepted, output, _ = self.steps(changes, ["yes", "yes"])
+        self.assertTrue(accepted)
+        self.assertNotIn("[y/N/d]", output)
+
+    def test_low_and_medium_changes_take_one_y(self):
+        changes = self.changes({}, {"extends": ["lang/node"]})
+        accepted, output, _ = self.steps(changes, ["y"])
+        self.assertTrue(accepted)
+        self.assertNotIn("HIGH-RISK", output)
+
+    def test_d_shows_details_and_asks_again_and_eof_cancels(self):
+        changes = self.changes({}, {"extends": ["lang/node"]})
+        accepted, output, details = self.steps(changes, ["d", "y"])
+        self.assertEqual((accepted, details, output.count("[y/N/d]")), (True, 1, 2))
+        self.assertFalse(self.steps(changes, [])[0])
+
+    def test_values_are_escaped(self):
+        changes = self.changes({}, {"setEnv": {"FOO": "\x1b[2J\x1b[31mfake"}})
+        text = self.sa.render_approval(self.project, "settings changed", changes, False)
+        self.assertNotIn("\x1b", text)
+        self.assertIn("\\u001b", text)
+
+    def test_unchanged_effect_still_shows_something(self):
+        grants, data, policy = self.state({})
+        previous = {"configuration": data, "base_configuration": policy["configuration"],
+                    "summary": self.sa.approval_summary(policy, grants)}
+        changes = self.sa.approval_changes(self.project, previous, data, grants, policy)
+        self.assertEqual([c["text"] for c in changes], ["resolved paths or bound files changed"])
+
+
 class NotifyRelayTest(unittest.TestCase):
     """Drives a real forked relay through its FIFO, with short limits."""
 

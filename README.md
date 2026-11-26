@@ -347,15 +347,25 @@ srt's on/off settings may be set in any layer; later layers win (project last). 
 
 ## Approvals
 
-A launch with new or changed global or project settings stops for approval at the terminal. The prompt shows:
+A launch with new or changed global or project settings stops for approval at the terminal. The prompt lists what changes for the agents since the last approval, one line per value, ranked by risk:
 
-1. the diff of the global config, imported file, agent group files and template since the last approval;
-2. the diff of the project file and of every group file it reaches;
-3. the resolved permissions;
-4. **one question per kind of loosening** since the last approval, each listing exactly what changed — new domains, removed domain blocks, new Unix sockets, new Mach services, new read or write access outside the project, removed read or write blocks, and switches turned on. Risky sockets (Docker, ssh-agent and the like) and every switch are explained on their own line. Answering no to any question launches nothing;
-5. the final question, `Approve these exact settings for this project?`.
+```
+srt-agent: approval needed for "~/Projects/taskle" (settings changed)
+  Groups: + "docker", + "lang/node"
 
-Tightening changes ask nothing extra. The first approval of a project compares against the global baseline, so only what the project and its groups add gets a question. Read and write access inside the project itself is the normal workspace and appears only in the diff.
+  HIGH    ~ allowAllUnixSockets: off → on   (via group docker)
+            EVERY Unix socket, including Docker's (root) and agents holding your keys
+  MEDIUM  + allowedDomains "registry.npmjs.org"   (via group lang/node)
+  MEDIUM  + "setEnv.FOO": "1"
+  low     - allowRead "~/old-tools"
+            tightens
+```
+
+- The lines come from the effective policy, before and after, so a change can't hide in formatting or inside an extended group. Each one says where it came from: a group, the global config, or (no note) the project file. An added group shows up once, on the `Groups` line; what it grants is listed with `via group`.
+- **HIGH:** switches that let code act outside the sandbox (`allowAllUnixSockets`, `allowAppleEvents`, the weaker-isolation switches), Unix sockets and Mach services, write access outside the project, and removed write blocks outside it. **MEDIUM:** domains, read access outside the project, removed read or domain blocks, `allowLocalBinding`, and changes to settings such as `setEnv`, `path`, `passEnv`, `agents` or `notify`. **low:** tightenings, access inside the project, and everything else.
+- Then come the questions, set apart from the summary. Each HIGH change gets its own step, and you must type `yes` in full. Everything else is approved together with one `y`, a step that's skipped when only HIGH changes remain. `d` at any question prints the full diff and resolved permissions, then asks again. Any other answer launches nothing and records nothing.
+
+The first approval of a project compares against your global settings, which are the baseline, so only what the project and its groups add is listed. Colors follow `NO_COLOR`, and every value from a config file is shown JSON-escaped, so a file can't spoof the prompt.
 
 Approval records live in `~/.local/state/srt-agent/approvals` (write-protected). `srt-agent project approve` reviews without launching; `srt-agent project revoke` forgets the approval. `--show` previews without approving, and unattended launches fail if not approved. Files are re-checked after you answer, so a change during review aborts the launch.
 

@@ -176,11 +176,12 @@ allowLocalBinding; the others it may only turn off. --allow-local-binding turns
 local binding on for one launch. allowPty may appear only as true; proxy
 ports are never accepted. Project files may also list allowedDomains and
 deniedDomains.
-Loosening prompts: before the final approval, each kind of loosening since
-the last approval gets its own question with the items listed: new
-domains, removed domain blocks, new Unix sockets, new Mach services, new
-read or write access (outside the project), removed read or write blocks,
-and switches turned on. Answering no to any of them launches nothing.
+Approval prompt: one line per changed value since the last approval,
+ranked HIGH (host-level switches, sockets, Mach services, writes outside
+the project), MEDIUM (domains, reads outside the project, setEnv/path/...)
+or low, each marked with the group it came from. Each HIGH change is its
+own step and needs "yes" typed in full; the rest take one "y". "d" shows
+the full diff. Any other answer launches nothing.
 Approval: an inline group is part of config.jsonc, so changing it asks
 every project again. A group file is bound only to the projects that
 extend it, directly or through another group: editing
@@ -1329,25 +1330,254 @@ def approval_summary(base_policy, grants):
     return summary
 
 
-def loosening_changes(old, new, project=None):
-    # Access inside the project itself is the expected workspace, not a
-    # loosening worth its own question; it still shows in the full diff.
-    changes = []
-    for key, direction, question in LOOSENING:
-        before, after = set(old.get(key, [])), set(new.get(key, []))
-        items = sorted(after - before) if direction == "added" else sorted(before - after)
-        if project is not None and key in ("allowRead", "allowWrite"):
-            items = [i for i in items if not Path(i).is_relative_to(project)]
-        if items:
-            changes.append((key, question, items))
-    return changes
-
-
 def risky_ipc(base_policy, grants):
     network = base_policy["effective_configuration"].get("network", {})
     sockets = list(network.get("allowUnixSockets", []) or []) + grants["allowUnixSockets"]
     warnings = [s for s in sockets if isinstance(s, str) and any(h in s.lower() for h in RISKY_SOCKET_HINTS)]
     return warnings
+
+
+# The approval prompt. It summarizes what changes for the agents, computed
+# from the effective policy (so nothing can hide in formatting or inside an
+# extended group), ranked by what a change grants, not where it was written.
+# The full diff stays one key ("d") away.
+RISK_LEVELS = ("high", "medium", "low")
+# Launcher keys whose changes matter for security even outside the policy.
+SENSITIVE_SETTINGS = ("setEnv", "path", "passEnv", "agents", "notify", "toolsVenv", "baseSettings", "agentHome",
+                      "crossSessionMessaging", "autoVenv")
+# Shown through their effect on the policy instead (plus every switch).
+SUMMARIZED_SETTINGS = ("network", "filesystem", "extends", "allowPty")
+
+
+def change_risk(key, loosens, value, project):
+    # (level, note) for one entry of the approval summary.
+    if not loosens:
+        return "low", "tightens"
+    inside = project is not None and key in ("allowRead", "allowWrite", "denyRead", "denyWrite") \
+        and Path(value).is_relative_to(project)
+    if key == "switches":
+        return ("high" if value in HOST_ONLY_SWITCHES else "medium"), SWITCHES[value][1]
+    if key == "allowUnixSockets":
+        risky = any(h in value.lower() for h in RISKY_SOCKET_HINTS)
+        return "high", ("can usually run commands or use credentials as you" if risky
+                        else "a host service outside the sandbox")
+    if key == "allowMachLookup":
+        return "high", "a host service outside the sandbox"
+    if key == "allowWrite":
+        return ("low", "inside the project") if inside else ("high", "write access outside the project")
+    if key == "denyWrite":
+        return ("medium", "a write block inside the project") if inside else ("high", "a write block removed")
+    if key == "allowRead":
+        return ("low", "inside the project") if inside else ("medium", "read access outside the project")
+    if key == "denyRead":
+        return "medium", "a read block removed"
+    if key == "allowedDomains":
+        return "medium", None
+    return "medium", "a domain block removed"  # deniedDomains
+
+
+def short_path(value, project):
+    # For display only: the project as ./, your home as ~/.
+    if not value.startswith("/"):
+        return value
+    path = Path(value)
+    if project is not None and path.is_relative_to(project):
+        return "./" + str(path.relative_to(project)) if path != project else "./"
+    if path.is_relative_to(account_home()):
+        return "~/" + str(path.relative_to(account_home()))
+    return value
+
+
+def change_sources(project, base_policy, extends):
+    # Find where an effective entry came from: an extended group, the
+    # global config, or (None) the project file itself.
+    layers = []
+    snapshot = base_policy.get("_groups")
+    if snapshot and extends:
+        groups = snapshot[0]
+        try:
+            order = expand_groups(extends, groups, group_directory(project, base_policy["path"]))
+        except (RuntimeError, SystemExit):
+            order = []
+        layers = [(name, groups[name]) for name in order if name in groups]
+    empty = {"allowUnixSockets": [], "allowMachLookup": [], "allowRead": [], "allowWrite": [], "denyRead": [],
+             "denyWrite": [], "remove": {}}
+    global_summary = approval_summary(base_policy, empty)
+
+    def spellings(entry):
+        text = entry["path"] if isinstance(entry, dict) else entry
+        if not isinstance(text, str):
+            return set()
+        try:
+            return {text, str(resolve_project_path(project, text)), str(resolve_project_path(project, text, False))}
+        except (RuntimeError, SystemExit, OSError):
+            return {text}
+
+    def source(key, value):
+        for name, layer in layers:
+            if key == "switches":
+                found = layer.get("switches", {}).get(value) is True
+            else:
+                section = "filesystem" if key in SRT_LISTS["filesystem"] else "network"
+                found = any(value in spellings(e) for e in layer.get(section, {}).get(key, []) or [])
+            if found:
+                return "via group " + name
+        if value in global_summary.get(key, []):
+            return "global config"
+        return None
+    return source
+
+
+def flat_settings(value, prefix=""):
+    # {path: display}: lists become sets of members, so a reordering is no
+    # change and one added entry is one line.
+    out = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            out.update(flat_settings(item, prefix + ("." if prefix else "") + str(key)))
+    elif isinstance(value, list):
+        for item in value:
+            out[prefix + "\0" + json.dumps(item, sort_keys=True, ensure_ascii=True)] = None
+    else:
+        out[prefix] = json.dumps(value, ensure_ascii=True)
+    return out
+
+
+def settings_changes(old, new, skip, level_for):
+    def short(text):
+        return text if len(text) <= 100 else text[:97] + "..."
+    before, after = flat_settings(old), flat_settings(new)
+    changes = []
+    for key in sorted(set(before) | set(after)):
+        top = key.split(".", 1)[0].split("\0", 1)[0]
+        if top in skip or before.get(key, 0) == after.get(key, 0):
+            continue
+        name, _, member = key.partition("\0")
+        if member:
+            sign, text = ("+" if key in after else "-"), json.dumps(name, ensure_ascii=True) + ": " + short(member)
+        elif key not in before:
+            sign, text = "+", json.dumps(name, ensure_ascii=True) + ": " + short(after[key])
+        elif key not in after:
+            sign, text = "-", json.dumps(name, ensure_ascii=True) + ": " + short(before[key])
+        else:
+            sign, text = "~", json.dumps(name, ensure_ascii=True) + ": " + short(before[key]) + " → " + short(after[key])
+        changes.append({"level": level_for(top), "sign": sign, "text": text, "note": None, "source": None})
+    return changes
+
+
+def approval_changes(project, previous, data, grants, base_policy, project_ok=False, venv=None, venv_ok=True):
+    # Everything the prompt lists, each {level, sign, text, note, source}.
+    changes = []
+    if not project_ok:
+        empty = {"allowUnixSockets": [], "allowMachLookup": [], "remove": {}, "allowRead": [], "allowWrite": [],
+                 "denyRead": [], "denyWrite": []}
+        old = previous.get("summary") if isinstance(previous.get("summary"), dict) else approval_summary(base_policy, empty)
+        new = approval_summary(base_policy, grants)
+        extends = data.get("extends", []) if isinstance(data.get("extends"), list) else []
+        source = change_sources(project, base_policy, extends)
+        for key, direction, _ in LOOSENING:
+            before, after = set(old.get(key, [])), set(new.get(key, []))
+            for value in sorted(after - before) + sorted(before - after):
+                added = value in after
+                loosens = added == (direction == "added")
+                level, note = change_risk(key, loosens, value, project)
+                if key == "switches":
+                    sign, text = "~", value + ": " + ("off → on" if added else "on → off")
+                else:
+                    sign, text = ("+" if added else "-"), key + " " + json.dumps(short_path(value, project),
+                                                                                ensure_ascii=True)
+                changes.append({"level": level, "sign": sign, "text": text, "note": note,
+                                "source": source(key, value)})
+        old_project = previous.get("configuration", {}) if isinstance(previous.get("configuration"), dict) else {}
+        old_extends = old_project.get("extends", []) if isinstance(old_project.get("extends"), list) else []
+        # Shown as one header line; what a group grants is listed above,
+        # marked "via group".
+        for name in extends:
+            if name not in old_extends:
+                changes.append({"level": "low", "kind": "group", "sign": "+", "text": name, "note": None,
+                                "source": None})
+        for name in old_extends:
+            if name not in extends:
+                changes.append({"level": "low", "kind": "group", "sign": "-", "text": name, "note": None,
+                                "source": None})
+
+        def level_for(top):
+            return "medium" if top in SENSITIVE_SETTINGS else "low"
+        project_only = {k: v for k, v in data.items() if not k.startswith("(")}
+        old_only = {k: v for k, v in old_project.items() if not k.startswith("(")}
+        changes += settings_changes(old_only, project_only, SUMMARIZED_SETTINGS + tuple(SWITCHES), level_for)
+        if isinstance(previous.get("base_configuration"), dict):
+            for change in settings_changes(previous["base_configuration"], base_policy["configuration"],
+                                           ("network", "filesystem", "allowPty") + tuple(SWITCHES), level_for):
+                change["source"] = "global config"
+                changes.append(change)
+        if not changes:
+            changes.append({"level": "low", "sign": "~", "text": "resolved paths or bound files changed",
+                            "note": "d shows the full detail", "source": None})
+    if not venv_ok:
+        changes.append({"level": "medium", "sign": "+", "text": "virtualenv " + json.dumps(venv["path"], ensure_ascii=True),
+                        "note": "its bin goes first on the agent PATH; its files become readable", "source": None})
+    order = {level: index for index, level in enumerate(RISK_LEVELS)}
+    return sorted(changes, key=lambda c: order[c["level"]])
+
+
+def paint(text, style, color):
+    codes = {"high": "1;31", "medium": "33", "low": "2", "bold": "1", "rule": "2"}
+    return "\033[" + codes[style] + "m" + text + "\033[0m" if color else text
+
+
+def render_change(change, color):
+    label = paint(change["level"].upper().ljust(6) if change["level"] != "low" else "low   ", change["level"], color)
+    line = "  " + label + "  " + change["sign"] + " " + change["text"]
+    if change["source"]:
+        line += paint("   (" + change["source"] + ")", "low", color)
+    if change["note"]:
+        line += "\n" + " " * 12 + change["note"]
+    return line + "\n"
+
+
+def render_approval(project, reason, changes, color, first=False):
+    out = "\n" + paint("srt-agent: approval needed for " + json.dumps(short_path(str(project), None), ensure_ascii=True),
+                       "bold", color)
+    out += " (" + reason + ")\n"
+    if first:
+        out += "  First approval: compared with your global settings, which are the baseline.\n"
+    groups = [c for c in changes if c.get("kind") == "group"]
+    if groups:
+        out += "  Groups: " + ", ".join(c["sign"] + " " + json.dumps(c["text"], ensure_ascii=True) for c in groups) + "\n"
+    out += "\n" + "".join(render_change(c, color) for c in changes if c.get("kind") != "group")
+    return out
+
+
+def approval_steps(changes, ask, write, details, color):
+    # One step per high-risk change, each needing "yes"; then one step for
+    # the rest, skipped when only high-risk changes remain. True if all
+    # accepted; any other answer cancels the whole approval.
+    rule = paint("─" * 60, "rule", color) + "\n"
+    high = [c for c in changes if c["level"] == "high"]
+    rest = [c for c in changes if c["level"] != "high"]
+
+    def prompt(text, accepted):
+        while True:
+            write(text)
+            answer = ask().strip().lower()
+            if answer != "d":
+                return answer in accepted
+            details()
+
+    for index, change in enumerate(high, 1):
+        write("\n" + rule + paint("HIGH-RISK change " + str(index) + " of " + str(len(high)), "high", color) + "\n"
+              + render_change(change, color))
+        if not prompt('Type "yes" to allow it, "d" for the full diff, anything else to cancel: ', ("yes",)):
+            return False
+    if rest or not high:
+        write("\n" + rule)
+        if high:
+            write("High-risk changes accepted. ")
+        if not prompt("Approve " + ("the other changes" if high else "these settings") + " for this project? [y/N/d] ",
+                      ("y", "yes")):
+            return False
+    return True
 
 
 def require_approval(project, path, raw, data, grants, base_policy, allow_home=False, venv=None, mode="env"):
@@ -1386,52 +1616,45 @@ def require_approval(project, path, raw, data, grants, base_policy, allow_home=F
             termios.tcflush(terminal_input.fileno(), termios.TCIFLUSH)
         except (ImportError, OSError):
             pass
-        if not project_ok:
-            terminal.write("\nsrt-agent: global or project settings are new or modified.\n")
-            terminal.write("Global file: " + json.dumps(base_policy["path"], ensure_ascii=True) + "\n")
-            old_base = (json.dumps(previous.get("base_configuration", {}), indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
-            new_base = (json.dumps(base_policy["configuration"], indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
-            terminal.write("\n" + "".join(difflib.unified_diff(old_base, new_base, fromfile="approved global", tofile="requested global")) + "\n")
-            terminal.write("Global filesystem permissions after project removals:\n" + json.dumps(base_policy["filesystem"], indent=2, sort_keys=True, ensure_ascii=True) + "\n")
-            terminal.write("File: " + json.dumps(str(path), ensure_ascii=True) + "\n")
-            old = (json.dumps(previous.get("configuration", {}), indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
-            new = (json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
-            terminal.write("\n" + "".join(difflib.unified_diff(old, new, fromfile="approved", tofile="requested")) + "\n")
-            terminal.write("Inherited entries to remove (exact matches):\n" + json.dumps(grants["remove"], indent=2, sort_keys=True, ensure_ascii=True) + "\n")
-            terminal.write("Resolved project permissions:\n" + json.dumps(grants, indent=2, sort_keys=True, ensure_ascii=True) + "\n")
-            if base_policy.get("tools"):
-                terminal.write("Shared tools venv (read-only, on every agent PATH, run as toolpy):\n"
-                               + json.dumps(base_policy["tools"], indent=2, sort_keys=True, ensure_ascii=True) + "\n")
-            if grants["allowUnixSockets"] or grants["allowMachLookup"]:
-                terminal.write("Host IPC services may act outside the sandbox. Review each service.\n")
-            for entry in risky_ipc(base_policy, grants):
-                terminal.write("WARNING: " + json.dumps(entry, ensure_ascii=True)
-                               + " can usually run commands or use credentials as you, outside the sandbox.\n")
-        if not project_ok:
-            # Ask separately for each kind of loosening, against what was
-            # last approved (or, the first time, against the global baseline),
-            # so a widened permission cannot hide inside a long diff.
-            empty = {"allowUnixSockets": [], "allowMachLookup": [], "remove": {}}
-            old_summary = previous.get("summary") if isinstance(previous.get("summary"), dict) else \
-                approval_summary(base_policy, {**empty, "allowRead": [], "allowWrite": [], "denyRead": [], "denyWrite": []})
-            for key, question, items in loosening_changes(old_summary, approval_summary(base_policy, grants), project):
-                terminal.write("\nLOOSENS SECURITY: " + question + ":\n")
-                for item in items:
-                    note = (" - " + SWITCHES[item][1]) if key == "switches" else ""
-                    if key == "allowUnixSockets" and any(h in item.lower() for h in RISKY_SOCKET_HINTS):
-                        note = " - can usually run commands or use credentials as you"
-                    terminal.write("    " + json.dumps(item, ensure_ascii=True) + note + "\n")
-                terminal.write("Accept " + ("this" if len(items) == 1 else "these " + str(len(items))) + "? [y/N] ")
-                terminal.flush()
-                if terminal_input.readline().strip().lower() not in ("y", "yes"):
-                    fail("Not approved (" + question + "); nothing was launched")
-        if not venv_ok:
-            terminal.write("\nsrt-agent: this virtualenv is not yet approved for this project.\n")
-            terminal.write("Its bin goes first on the agent PATH and these paths become readable:\n"
-                           + json.dumps(venv, indent=2, sort_keys=True, ensure_ascii=True) + "\n")
-        terminal.write("Approve these exact settings for this project? [y/N] ")
-        terminal.flush()
-        accepted = terminal_input.readline().strip().lower() in ("y", "yes")
+
+        def details():
+            # d: the full record, as shown before the summary existed.
+            if not project_ok:
+                terminal.write("\nsrt-agent: global or project settings are new or modified.\n")
+                terminal.write("Global file: " + json.dumps(base_policy["path"], ensure_ascii=True) + "\n")
+                old_base = (json.dumps(previous.get("base_configuration", {}), indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
+                new_base = (json.dumps(base_policy["configuration"], indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
+                terminal.write("\n" + "".join(difflib.unified_diff(old_base, new_base, fromfile="approved global", tofile="requested global")) + "\n")
+                terminal.write("Global filesystem permissions after project removals:\n" + json.dumps(base_policy["filesystem"], indent=2, sort_keys=True, ensure_ascii=True) + "\n")
+                terminal.write("File: " + json.dumps(str(path), ensure_ascii=True) + "\n")
+                old = (json.dumps(previous.get("configuration", {}), indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
+                new = (json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True) + "\n").splitlines(True)
+                terminal.write("\n" + "".join(difflib.unified_diff(old, new, fromfile="approved", tofile="requested")) + "\n")
+                terminal.write("Inherited entries to remove (exact matches):\n" + json.dumps(grants["remove"], indent=2, sort_keys=True, ensure_ascii=True) + "\n")
+                terminal.write("Resolved project permissions:\n" + json.dumps(grants, indent=2, sort_keys=True, ensure_ascii=True) + "\n")
+                if base_policy.get("tools"):
+                    terminal.write("Shared tools venv (read-only, on every agent PATH, run as toolpy):\n"
+                                   + json.dumps(base_policy["tools"], indent=2, sort_keys=True, ensure_ascii=True) + "\n")
+                if grants["allowUnixSockets"] or grants["allowMachLookup"]:
+                    terminal.write("Host IPC services may act outside the sandbox. Review each service.\n")
+                for entry in risky_ipc(base_policy, grants):
+                    terminal.write("WARNING: " + json.dumps(entry, ensure_ascii=True)
+                                   + " can usually run commands or use credentials as you, outside the sandbox.\n")
+            if not venv_ok:
+                terminal.write("Virtualenv (bin first on the agent PATH, these paths readable):\n"
+                               + json.dumps(venv, indent=2, sort_keys=True, ensure_ascii=True) + "\n")
+            terminal.flush()
+
+        def write(text):
+            terminal.write(text)
+            terminal.flush()
+
+        color = not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
+        changes = approval_changes(project, previous, data, grants, base_policy, project_ok, venv, venv_ok)
+        first = not project_ok and not isinstance(previous.get("summary"), dict)
+        reason = "new virtualenv" if project_ok else ("first approval" if first else "settings changed")
+        write(render_approval(project, reason, changes, color, first=first))
+        accepted = approval_steps(changes, terminal_input.readline, write, details, color)
     if not accepted:
         fail("Project settings were not approved; nothing was launched")
     # Parse once, approve that snapshot, and generate from it. Refuse changes
@@ -2909,6 +3132,8 @@ def merge_layers(layers):
     merged = {}
     for layer in layers:
         for section in ("filesystem", "network"):
+            if section in layer:
+                merged.setdefault(section, {})  # an empty "filesystem": {} still counts as given
             for name, entries in layer.get(section, {}).items():
                 target = merged.setdefault(section, {}).setdefault(name, [])
                 target.extend(e for e in entries if e not in target)
