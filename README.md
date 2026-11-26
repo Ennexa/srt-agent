@@ -461,7 +461,7 @@ With tmux, `set -g monitor-bell on` and `set -g bell-action other` turn the bell
 "notify": {"command": ["/usr/local/libexec/srt-agent-notify"]},
 ```
 
-The agent gets `SRT_AGENT_NOTIFY`, a named pipe in its temp folder, and may write only the words `stop`, `notification`, `permission`, `idle` or `failure`, one per line; anything else is ignored, and each word is limited to one per 3 seconds. A relay outside the sandbox then runs your program with JSON on stdin, shaped like a Claude Code hook input so hook-based tools can read it:
+The agent gets `SRT_AGENT_NOTIFY`, a named pipe in its temp folder, and may write only the words `stop`, `notification`, `permission`, `idle` or `failure`, one per line; anything else is ignored, and each word is limited to one per 3 seconds. At most 4 programs run at once; events arriving meanwhile are dropped. Dropped lines are counted and logged as one summary a minute, so a flood can't crowd real events out of the log. A relay outside the sandbox then runs your program with JSON on stdin, shaped like a Claude Code hook input so hook-based tools can read it:
 
 ```json
 {"hook_event_name": "Stop", "session_id": "…", "cwd": "/Users/you/Projects/taskle",
@@ -469,7 +469,7 @@ The agent gets `SRT_AGENT_NOTIFY`, a named pipe in its temp folder, and may writ
  "srt_agent": {"event": "stop", "agent": "claude", "project": "/Users/you/Projects/taskle", "tmux_pane": "%7"}}
 ```
 
-Every value comes from the launcher, recorded before the sandbox started; no agent text is passed on, and nothing flows back — no replies and no permission decisions, so approvals always happen in the session itself. The program's environment holds only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TMUX`, `TMUX_PANE`, `WEZTERM_PANE`, `TMPDIR`, `__CFBundleIdentifier` and `TERM_PROGRAM` from your launch. The program is write-denied in every session, both as named and with symlinks resolved; files it imports or runs are not. The relay ends with the session. Claude hooks for it:
+Every value comes from the launcher, recorded before the sandbox started; no agent text is passed on, and nothing flows back — no replies and no permission decisions, so approvals always happen in the session itself. The program's environment holds only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TMUX`, `TMUX_PANE`, `WEZTERM_PANE`, `TMPDIR`, `__CFBundleIdentifier` and `TERM_PROGRAM` from your launch. Its `PATH` leaves out any folder inside the project, and it starts in `/`, so neither it nor the helpers it looks up are taken from the workspace. A program still running after 10 minutes gets `SIGTERM` for its process group, then `SIGKILL` 5 seconds later. The program is write-denied in every session, both as named and with symlinks resolved; files it imports or runs are not. The relay ends with the session. Claude hooks for it:
 
 ```jsonc
 "Stop": [{"hooks": [{"type": "command", "command": "[ -n \"$SRT_AGENT_NOTIFY\" ] && printf 'stop\\n' > \"$SRT_AGENT_NOTIFY\" || true"}]}],
@@ -502,7 +502,7 @@ Outside tmux, the WezTerm check uses `lsappinfo` for the frontmost app and `wezt
 - **In tmux:** it selects the agent's pane in the session's most recently used client (`switch-client -c <tty>`, `select-window`, `select-pane`). In WezTerm it also switches to the tab and pane running that tmux client, found by matching the client's tty in `wezterm cli list` (`activate-tab`, `activate-pane`). Ghostty has no such command, so there you only get the app brought forward.
 - **Outside tmux in WezTerm:** it activates the agent's tab and pane. A timeout, dismissal or focus-removal does nothing. Under tmux, `__CFBundleIdentifier` is the terminal that started the tmux server.
 
-The notifier runs only `tmux` (on the `$TMUX` socket), `lsappinfo`, `wezterm` (`list-clients`, `list`, `activate-tab`, `activate-pane`), `alerter` and `open`, always with argument lists. It ignores any input it doesn't expect, and nothing goes back to the agent. Each decision is written as one line to stderr, which the relay records in `~/.local/state/srt-agent/notify.log` (for example `stderr: WezTerm pane 3 focused: silent`). You can change the icon, the timeout and the program paths with the constants at the top of the script.
+The notifier runs only `tmux` (on the `$TMUX` socket), `lsappinfo`, `wezterm` (`list-clients`, `list`, `activate-tab`, `activate-pane`), `alerter` and `open`, always with argument lists. It ignores any input it doesn't expect, and nothing goes back to the agent. Each decision is written as one line to stderr, which the relay records in `~/.local/state/srt-agent/notify.log` (for example `stderr: WezTerm pane 3 focused: silent`). The click helper runs in its own session, outside the relay's supervision, so it stops waiting for `alerter` after an hour (`HELPER_DEADLINE`), even for a persistent notification. You can change the icon, the timeouts and the program paths with the constants at the top of the script.
 
 **Known limitation:** tmux tracks the active window and pane per session, not per client. If two clients show the same session, "focused" and "visible" can be wrong.
 

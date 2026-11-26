@@ -2020,9 +2020,18 @@ def apply_template(home, manifest_path, chosen):
         if stat.S_ISLNK(info.st_mode):
             return "link", "link -> " + os.readlink(name, dir_fd=fd)
         if stat.S_ISREG(info.st_mode):
-            handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            # The agent can swap the file between lstat and open: open
+            # non-blocking (a FIFO must not hang the launch) and check what
+            # was opened. Template files are at most 1 MiB, so a larger file
+            # cannot match one: report its size instead of reading it.
+            handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
             with os.fdopen(handle, "rb") as stream:
-                return "file", hashlib.sha256(stream.read()).hexdigest()
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    return "other", None
+                if opened.st_size > TEMPLATE_FILE_LIMIT:
+                    return "file", "larger than the template limit (" + str(opened.st_size) + " bytes)"
+                return "file", hashlib.sha256(stream.read(TEMPLATE_FILE_LIMIT + 1)).hexdigest()
         return "other", None
 
     def make_room(fd, name, rel, kind):
@@ -2118,6 +2127,9 @@ NOTIFY_EVENTS = {
 }
 NOTIFY_MIN_INTERVAL = 3.0
 NOTIFY_MAX_SECONDS = 600  # a notification may wait this long for a click
+NOTIFY_KILL_GRACE = 5  # seconds between SIGTERM and SIGKILL for its process group
+NOTIFY_MAX_RUNNING = 4  # events arriving while this many still run are dropped
+NOTIFY_LOG_SUMMARY = 60  # seconds; dropped lines are counted, logged at most this often
 NOTIFY_HOST_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMUX", "TMUX_PANE", "TMPDIR",
                    "__CFBundleIdentifier", "TERM_PROGRAM", "WEZTERM_PANE")
 
@@ -2199,6 +2211,18 @@ def start_notify_relay(command, temp, agent, project):
         log("relay started: agent=" + agent + " project=" + str(project) + " pane="
             + host_env.get("TMUX_PANE", "-") + " command=" + json.dumps(command))
         running = []  # (process, started, word, error file)
+        # Lines the agent can produce at will are counted, not logged one by
+        # one, so a flood cannot crowd real events out of the capped log.
+        dropped, summarized = {}, [time.monotonic()]
+
+        def drop(reason, force=False):
+            if reason:
+                dropped[reason] = dropped.get(reason, 0) + 1
+            now = time.monotonic()
+            if dropped and (force or now - summarized[0] >= NOTIFY_LOG_SUMMARY):
+                log("dropped: " + ", ".join(str(n) + " " + r for r, n in sorted(dropped.items())))
+                dropped.clear()
+                summarized[0] = now
 
         def reap(final=False):
             # The program runs in its own session and may leave helpers
@@ -2208,11 +2232,18 @@ def start_notify_relay(command, temp, agent, project):
                 process, started, word, errors = item
                 code = process.poll()
                 if code is None and (final or time.monotonic() - started > NOTIFY_MAX_SECONDS):
-                    try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except OSError:
-                        pass
-                    code = process.wait()
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            os.killpg(process.pid, sig)
+                        except OSError:
+                            pass
+                        try:
+                            code = process.wait(timeout=NOTIFY_KILL_GRACE)
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    if code is None:
+                        continue  # unkillable (e.g. stuck in the kernel): retry on the next pass
                     word += " (stopped after time limit)" if not final else " (session ended)"
                 if code is None:
                     continue
@@ -2227,6 +2258,7 @@ def start_notify_relay(command, temp, agent, project):
 
         while os.getppid() == parent:
             reap()
+            drop(None)
             ready, _, _ = select.select([reader], [], [], 1.0)
             if not ready:
                 continue
@@ -2239,11 +2271,14 @@ def start_notify_relay(command, temp, agent, project):
             for line in lines:
                 word = line.strip().decode("ascii", "replace")
                 if word not in NOTIFY_EVENTS:
-                    log("ignored a line that is not an event word (" + str(len(line)) + " bytes)")
+                    drop("lines that are not event words")
                     continue  # anything else is ignored, never passed on
                 now = time.monotonic()
                 if now - last.get(word, -NOTIFY_MIN_INTERVAL) < NOTIFY_MIN_INTERVAL:
-                    log("event " + word + ": rate-limited")
+                    drop(word + " (rate-limited)")
+                    continue
+                if len(running) >= NOTIFY_MAX_RUNNING:
+                    drop(word + " (" + str(NOTIFY_MAX_RUNNING) + " still running)")
                     continue
                 last[word] = now
                 hook_name, text = NOTIFY_EVENTS[word]
@@ -2273,6 +2308,7 @@ def start_notify_relay(command, temp, agent, project):
         except Exception:
             pass
         try:
+            drop(None, force=True)
             log("relay ended")
         except Exception:
             pass

@@ -31,6 +31,10 @@ import sys
 
 ICON = "/Applications/Claude.app/Contents/Resources/electron.icns"
 TIMEOUT = 30  # seconds; only used when focusing a tmux pane can't clear the notification
+# The click helper outlives the relay's supervision (own session, so the
+# relay is not held up): it gives up on alerter after this long, even for
+# a persistent notification.
+HELPER_DEADLINE = 3600
 # Absolute path for each program, or None to look it up on PATH.
 PROGRAMS = {"tmux": None, "lsappinfo": None, "alerter": None, "open": None,
             "wezterm": "/Applications/WezTerm.app/Contents/MacOS/wezterm"}
@@ -212,8 +216,11 @@ def notify(agent, msg, group, persistent, pane, wezterm_pane):
         null = os.open(os.devnull, os.O_RDWR)
         for fd in (0, 1, 2):
             os.dup2(null, fd)
-        out = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, text=True).stdout
+        try:
+            out = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, timeout=HELPER_DEADLINE).stdout
+        except subprocess.TimeoutExpired:  # alerter is killed; the notification stays in Notification Center
+            out = ""
         if clicked(out):
             jump(pane, wezterm_pane)
     finally:

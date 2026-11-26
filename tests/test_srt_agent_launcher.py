@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -96,6 +97,16 @@ class LauncherTest(unittest.TestCase):
             self.sa.load_base_policy = original
         self.assertEqual((Path(child_env["HOME"]) / ".config/x.txt").read_text(), "hello")
 
+    def test_oversized_file_at_a_template_path_is_backed_up_unread(self):
+        child_env = self.launch()[3]
+        target = Path(child_env["HOME"]) / ".config/x.txt"
+        target.unlink()
+        with open(target, "wb") as handle:
+            handle.truncate(self.sa.TEMPLATE_FILE_LIMIT * 64)  # sparse: big, but cheap to create
+        self.launch()
+        self.assertEqual(target.read_text(), "hello")
+        self.assertEqual(len(list(target.parent.glob("x.txt.srt-agent-backup-*"))), 1)
+
     def test_snapshots_stay_out_of_the_approval_identity(self):
         policy = self.sa.load_base_policy(self.project, self.config / "config.jsonc")
         self.assertIn("_template_scopes", policy)
@@ -134,6 +145,62 @@ class LauncherTest(unittest.TestCase):
         self.write_project({"setEnv": {"DEVELOPER_DIR": str(COMMAND_LINE_TOOLS)}})
         env = self.launch()[4]
         self.assertEqual(env["DEVELOPER_DIR"], str(COMMAND_LINE_TOOLS.resolve()))
+
+
+class NotifyRelayTest(unittest.TestCase):
+    """Drives a real forked relay through its FIFO, with short limits."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.sa = load_launcher()
+        home = self.base / "home"
+        home.mkdir()
+        self.sa.account_home = lambda: home
+        self.log = self.sa.approval_directory(create=True).parent / "notify.log"
+        self.temp = self.base / "tmp"
+        self.temp.mkdir()
+        self.sa.NOTIFY_MIN_INTERVAL = 0
+        self.sa.NOTIFY_LOG_SUMMARY = 0
+
+    def start(self, script):
+        program = self.base / "notify.sh"
+        program.write_text("#!/bin/sh\n" + script)
+        program.chmod(0o755)
+        fifo = self.sa.start_notify_relay([str(program)], str(self.temp), "claude", self.base)
+        writer = os.open(fifo, os.O_WRONLY)
+        self.addCleanup(os.close, writer)
+        return writer
+
+    def wait_for(self, text, count=1, seconds=15):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            log = self.log.read_text() if self.log.exists() else ""
+            if log.count(text) >= count:
+                return log
+            time.sleep(0.1)
+        self.fail("log never showed " + repr(text) + " x" + str(count) + ":\n" + log)
+
+    def test_junk_lines_are_summarized_not_logged_one_by_one(self):
+        self.sa.NOTIFY_LOG_SUMMARY = 1
+        writer = self.start("exit 0\n")
+        os.write(writer, b"junk\n" * 500 + b"stop\n")
+        log = self.wait_for("event stop: exit 0")
+        self.wait_for("lines that are not event words")
+        self.assertLess(log.count("\n"), 50)
+
+    def test_events_beyond_the_running_cap_are_dropped(self):
+        writer = self.start("sleep 30\n")
+        os.write(writer, b"".join(w.encode() + b"\n" for w in list(self.sa.NOTIFY_EVENTS)[:5]))
+        self.wait_for(": started", count=self.sa.NOTIFY_MAX_RUNNING)
+        self.wait_for("still running")
+
+    def test_a_program_ignoring_sigterm_is_killed(self):
+        self.sa.NOTIFY_MAX_SECONDS = 0.5
+        self.sa.NOTIFY_KILL_GRACE = 1
+        writer = self.start("trap '' TERM\nwhile :; do sleep 1; done\n")
+        os.write(writer, b"stop\n")
+        self.wait_for("stopped after time limit")
 
 
 if __name__ == "__main__":
